@@ -523,15 +523,18 @@ func bootstrapRaftFromWAL(cfg config.ServerConfig, bwal *bootstrappedWAL) *boots
 
 func raftConfig(cfg config.ServerConfig, id uint64, s *raft.MemoryStorage) *raft.Config {
 	return &raft.Config{
-		ID:              id,
-		ElectionTick:    cfg.ElectionTicks,
-		HeartbeatTick:   1,
-		Storage:         s,
-		MaxSizePerMsg:   maxSizePerMsg,
-		MaxInflightMsgs: maxInflightMsgs,
-		CheckQuorum:     true,
-		PreVote:         cfg.PreVote,
-		Logger:          NewRaftLoggerZap(cfg.Logger.Named("raft")),
+		ID:                      id,
+		ElectionTick:            cfg.ElectionTicks,
+		HeartbeatTick:           1,
+		Storage:                 s,
+		MaxSizePerMsg:           maxSizePerMsg,
+		MaxInflightMsgs:         maxInflightMsgs,
+		CheckQuorum:             true,
+		PreVote:                 cfg.PreVote,
+		ReadOnlyOption:          raft.ReadOnlyGrantLeases,
+		ReadLeaseDurationMicros: 100000, // 100ms
+		MaxNumReadLeases:        5,
+		Logger:                  NewRaftLoggerZap(cfg.Logger.Named("raft")),
 	}
 }
 
