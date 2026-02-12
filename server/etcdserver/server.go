@@ -420,6 +420,23 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 	// the hook being called during the initialization process.
 	srv.be.SetTxPostLockInsideApplyHook(srv.getTxPostLockInsideApplyHook())
 
+	var udpSideC *rafthttp.UdpSidechannel
+	if cfg.ExperimentalEnableUdpSidechannel {
+		ip := cfg.ExperimentalUdpSidechannelIP
+		if ip == "" {
+			ip = rafthttp.DefaultUdpSidechannelIP
+		}
+		port := cfg.ExperimentalUdpSidechannelPort
+		if port == 0 {
+			port = rafthttp.DefaultUdpSidechannelPort
+		}
+		magic := cfg.ExperimentalUdpSidechannelMagic
+		if magic == 0 {
+			magic = rafthttp.DefaultUdpSidechannelMagic
+		}
+		udpSideC = rafthttp.NewUdpSidechannel(b.cluster.nodeID, ip, port, magic, cfg.Logger)
+	}
+
 	// TODO: move transport initialization near the definition of remote
 	tr := &rafthttp.Transport{
 		Logger:      cfg.Logger,
@@ -433,6 +450,7 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 		ServerStats: sstats,
 		LeaderStats: lstats,
 		ErrorC:      srv.errorc,
+		UdpSideC:    udpSideC,
 	}
 	if err = tr.Start(); err != nil {
 		return nil, err

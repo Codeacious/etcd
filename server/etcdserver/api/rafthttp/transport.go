@@ -128,6 +128,8 @@ type Transport struct {
 
 	pipelineProber probing.Prober
 	streamProber   probing.Prober
+
+	UdpSideC *UdpSidechannel
 }
 
 func (t *Transport) Start() error {
@@ -224,6 +226,9 @@ func (t *Transport) Stop() {
 	}
 	if tr, ok := t.pipelineRt.(*http.Transport); ok {
 		tr.CloseIdleConnections()
+	}
+	if t.UdpSideC != nil {
+		t.UdpSideC.Stop()
 	}
 	t.peers = nil
 	t.remotes = nil

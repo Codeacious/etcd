@@ -207,6 +207,24 @@ type ServerConfig struct {
 	// ExperimentalLocalAddress is the local IP address to use when communicating with a peer.
 	ExperimentalLocalAddress string `json:"experimental-local-address"`
 
+	// ExperimentalEnableUdpSidechannel enables the UDP sidechannel to allow a P4 switch
+	// to generate read-lease ACKs and mark read index requests with saved log indicies.
+	// If this is enabled, RAFT (and thus etcd) will no longer function unless a P4 switch is marking
+	// read index requests with saved log indicies from log appends.
+	ExperimentalEnableUdpSidechannel bool `json:"experimental-enable-udp-sidechannel"`
+
+	// ExperimentalUdpSidechannelIP is the local IP address the UDP sidechannel
+	// listens on. Defaults to DefaultUdpSidechannelIP.
+	ExperimentalUdpSidechannelIP string `json:"experimental-udp-sidechannel-ip"`
+
+	// ExperimentalUdpSidechannelPort is the port the UDP sidechannel listens on.
+	// Defaults to DefaultUdpSidechannelPort.
+	ExperimentalUdpSidechannelPort int `json:"experimental-udp-sidechannel-port"`
+
+	// ExperimentalUdpSidechannelMagic is the 16-bit magic number used in the
+	// UDP sidechannel protocol. Defaults to DefaultUdpSidechannelMagic.
+	ExperimentalUdpSidechannelMagic uint16 `json:"experimental-udp-sidechannel-magic"`
+
 	// ServerFeatureGate is a server level feature gate
 	ServerFeatureGate featuregate.FeatureGate
 

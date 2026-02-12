@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"path"
 	"strings"
@@ -437,6 +438,40 @@ func (h *streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	udpSPortStr := r.Header.Get("X-Raft-SidechannelPort")
+	udpSPortMagicStr := r.Header.Get("X-Raft-SidechannelMagic")
+	attachedUdpPeer := false
+	if udpSPortStr != "" && udpSPortMagicStr != "" && h.tr.UdpSideC != nil {
+		// Try to get the real IP from proxy headers first, if they exist
+		remoteAddr := r.Header.Get("X-Real-IP")
+		if remoteAddr == "" {
+			remoteAddr = r.Header.Get("X-Forwarded-For")
+			// Grabs the first IP in the X-Forwarded-For list
+			if idx := strings.Index(remoteAddr, ","); idx != -1 {
+				remoteAddr = strings.TrimSpace(remoteAddr[:idx])
+			}
+		}
+		if remoteAddr == "" {
+			remoteAddr, _, err = net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				h.lg.Warn("failed to parse remote address from HTTP request for UDP sidechannel",
+					zap.String("remote-addr", r.RemoteAddr),
+					zap.Error(err))
+				remoteAddr = ""
+			}
+		}
+
+		// Validate that remoteAddr is a valid IP address
+		if net.ParseIP(remoteAddr) == nil {
+			h.lg.Warn("failed to parse valid IP address for UDP sidechannel",
+				zap.String("remote-addr", r.RemoteAddr),
+				zap.String("parsed-ip", remoteAddr))
+		} else {
+			h.tr.UdpSideC.AttachPeer(from, remoteAddr, udpSPortStr, udpSPortMagicStr)
+			attachedUdpPeer = true
+		}
+	}
+
 	w.WriteHeader(http.StatusOK)
 	w.(http.Flusher).Flush()
 
@@ -451,6 +486,10 @@ func (h *streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	p.attachOutgoingConn(conn)
 	<-c.closeNotify()
+
+	if attachedUdpPeer {
+		h.tr.UdpSideC.DetachPeer(from)
+	}
 }
 
 // checkClusterCompatibilityFromHeader checks the cluster compatibility of

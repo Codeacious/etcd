@@ -128,6 +128,8 @@ type streamWriter struct {
 	connc chan *outgoingConn
 	stopc chan struct{}
 	done  chan struct{}
+
+	udpSideC *UdpSidechannel
 }
 
 // startStreamWriter creates a streamWrite and starts a long running go-routine that accepts
@@ -139,13 +141,14 @@ func startStreamWriter(lg *zap.Logger, local, id types.ID, status *peerStatus, f
 		localID: local,
 		peerID:  id,
 
-		status: status,
-		fs:     fs,
-		r:      r,
-		msgc:   make(chan raftpb.Message, streamBufSize),
-		connc:  make(chan *outgoingConn),
-		stopc:  make(chan struct{}),
-		done:   make(chan struct{}),
+		status:   status,
+		fs:       fs,
+		r:        r,
+		msgc:     make(chan raftpb.Message, streamBufSize),
+		connc:    make(chan *outgoingConn),
+		stopc:    make(chan struct{}),
+		done:     make(chan struct{}),
+		udpSideC: nil,
 	}
 	go w.run()
 	return w
@@ -182,6 +185,9 @@ func (cw *streamWriter) run() {
 				batched = 0
 				sentBytes.WithLabelValues(cw.peerID.String()).Add(float64(unflushed))
 				unflushed = 0
+				if cw.udpSideC != nil {
+					cw.udpSideC.Flush()
+				}
 				continue
 			}
 
@@ -200,6 +206,10 @@ func (cw *streamWriter) run() {
 			heartbeatc, msgc = nil, nil
 
 		case m := <-msgc:
+			if cw.udpSideC != nil {
+				cw.udpSideC.ProcessOutgoingMessage(&m)
+			}
+
 			err := enc.encode(&m)
 			if err == nil {
 				unflushed += m.Size()
@@ -209,6 +219,9 @@ func (cw *streamWriter) run() {
 					sentBytes.WithLabelValues(cw.peerID.String()).Add(float64(unflushed))
 					unflushed = 0
 					batched = 0
+					if cw.udpSideC != nil {
+						cw.udpSideC.Flush()
+					}
 				} else {
 					batched++
 				}
@@ -583,6 +596,11 @@ func (cr *streamReader) dial(t streamType) (io.ReadCloser, error) {
 	req.Header.Set("X-Min-Cluster-Version", version.MinClusterVersion)
 	req.Header.Set("X-Etcd-Cluster-ID", cr.tr.ClusterID.String())
 	req.Header.Set("X-Raft-To", cr.peerID.String())
+
+	if cr.tr.UdpSideC != nil {
+		req.Header.Set("X-Raft-SidechannelPort", cr.tr.UdpSideC.Port())
+		req.Header.Set("X-Raft-SidechannelMagic", cr.tr.UdpSideC.MagicAsStr())
+	}
 
 	setPeerURLsHeader(req, cr.tr.URLs)
 

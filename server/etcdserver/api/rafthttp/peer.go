@@ -169,12 +169,35 @@ func startPeer(t *Transport, urls types.URLs, peerID types.ID, fs *stats.Followe
 		stopc:          make(chan struct{}),
 	}
 
+	if t.UdpSideC != nil {
+		p.msgAppV2Writer.udpSideC = t.UdpSideC
+		p.writer.udpSideC = t.UdpSideC
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 	go func() {
+		var udpReady <-chan raftpb.Message
 		for {
+			if udpReady == nil && t.UdpSideC != nil {
+				udpReady = t.UdpSideC.GetReadyChan(peerID)
+			}
 			select {
+			case mm, ok := <-udpReady:
+				if !ok {
+					udpReady = nil
+					continue
+				}
+				if err := r.Process(ctx, mm); err != nil {
+					if t.Logger != nil {
+						t.Logger.Warn("failed to process udpSidechannel Raft message", zap.Error(err))
+					}
+				}
 			case mm := <-p.recvc:
+				if t.UdpSideC != nil && t.UdpSideC.ProcessIncomingMessage(ctx, mm) {
+					// Message enqueued into udp sidechannel
+					continue
+				}
 				if err := r.Process(ctx, mm); err != nil {
 					if t.Logger != nil {
 						t.Logger.Warn("failed to process Raft message", zap.Error(err))
