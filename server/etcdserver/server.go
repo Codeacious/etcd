@@ -235,6 +235,9 @@ type EtcdServer struct {
 	// when there is no error
 	readNotifier *notifier
 
+	// udpSideC is a reference to the UDP sidechannel for server-initiated switch queries.
+	udpSideC *rafthttp.UdpSidechannel
+
 	// stop signals the run goroutine should shutdown.
 	stop chan struct{}
 	// stopping is closed by run goroutine on shutdown.
@@ -420,7 +423,6 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 	// the hook being called during the initialization process.
 	srv.be.SetTxPostLockInsideApplyHook(srv.getTxPostLockInsideApplyHook())
 
-	var udpSideC *rafthttp.UdpSidechannel
 	if cfg.ExperimentalEnableUdpSidechannel {
 		ip := cfg.ExperimentalUdpSidechannelIP
 		if ip == "" {
@@ -434,7 +436,8 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 		if magic == 0 {
 			magic = rafthttp.DefaultUdpSidechannelMagic
 		}
-		udpSideC = rafthttp.NewUdpSidechannel(b.cluster.nodeID, ip, port, magic, cfg.Logger)
+		srv.udpSideC = rafthttp.NewUdpSidechannel(b.cluster.nodeID, ip, port,
+			magic, srv, cfg.Logger)
 	}
 
 	// TODO: move transport initialization near the definition of remote
@@ -450,7 +453,7 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 		ServerStats: sstats,
 		LeaderStats: lstats,
 		ErrorC:      srv.errorc,
-		UdpSideC:    udpSideC,
+		UdpSideC:    srv.udpSideC,
 	}
 	if err = tr.Start(); err != nil {
 		return nil, err

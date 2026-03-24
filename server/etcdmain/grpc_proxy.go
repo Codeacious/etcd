@@ -52,6 +52,7 @@ import (
 	"go.etcd.io/etcd/client/v3/ordering"
 	"go.etcd.io/etcd/pkg/v3/debugutil"
 	"go.etcd.io/etcd/server/v3/embed"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/rafthttp"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/v3election/v3electionpb"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/v3lock/v3lockpb"
 	"go.etcd.io/etcd/server/v3/proxy/grpcproxy"
@@ -104,6 +105,10 @@ var (
 	grpcProxyEnableLogging  bool
 
 	grpcProxyDebug bool
+
+	// UDP sidechannel / read-gate balancer options.
+	grpcProxyUdpSidechannelMagic int
+	grpcProxyUdpSidechannelPort  int
 
 	// GRPC keep alive related options.
 	grpcKeepAliveMinTime  time.Duration
@@ -180,6 +185,8 @@ func newGRPCProxyStartCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&grpcProxyEnableOrdering, "experimental-serializable-ordering", false, "Ensure serializable reads have monotonically increasing store revisions across endpoints.")
 	cmd.Flags().StringVar(&grpcProxyLeasing, "experimental-leasing-prefix", "", "leasing metadata prefix for disconnected linearized reads.")
 	cmd.Flags().BoolVar(&grpcProxyEnableLogging, "experimental-enable-grpc-logging", false, "logging all grpc requests and responses")
+	cmd.Flags().IntVar(&grpcProxyUdpSidechannelMagic, "experimental-udp-sidechannel-magic", 0, "magic for P4 switch UDP sidechannel (enables read gating if set)")
+	cmd.Flags().IntVar(&grpcProxyUdpSidechannelPort, "experimental-udp-sidechannel-port", rafthttp.DefaultUdpSidechannelPort, "UDP port of the etcd server sidechannel")
 
 	cmd.Flags().BoolVar(&grpcProxyDebug, "debug", false, "Enable debug-level logging for grpc-proxy.")
 
@@ -248,6 +255,15 @@ func startGRPCProxy(cmd *cobra.Command, args []string) {
 		grpcl.Close()
 		lg.Info("stop listening gRPC proxy client requests", zap.String("address", grpcProxyListenAddr))
 	}()
+
+	if grpcProxyUdpSidechannelMagic != 0 {
+		if err := rafthttp.RegisterUdpSidechannelBalancer(uint16(grpcProxyUdpSidechannelMagic), grpcProxyUdpSidechannelPort); err != nil {
+			lg.Fatal("failed to register udp sidechannel gRPC balancer", zap.Error(err))
+		}
+		lg.Info("registered P4 switch udp sidechannel gRPC balancer",
+			zap.Int("magic", grpcProxyUdpSidechannelMagic),
+			zap.Int("udp-port", grpcProxyUdpSidechannelPort))
+	}
 
 	client := mustNewClient(lg)
 
@@ -417,6 +433,9 @@ func newClientCfg(lg *zap.Logger, eps []string) (*clientv3.Config, error) {
 		cfg.DialKeepAliveTimeout = grpcProxyDialKeepAliveTimeout
 	}
 	cfg.PermitWithoutStream = grpcProxyPermitWithoutStream
+	if grpcProxyUdpSidechannelMagic != 0 {
+		cfg.LBPolicy = rafthttp.UdpSidechannelBalancerName
+	}
 
 	tls := newTLS(grpcProxyCA, grpcProxyCert, grpcProxyKey, true)
 	if tls == nil && grpcProxyInsecureSkipTLSVerify {

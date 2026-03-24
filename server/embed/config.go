@@ -522,6 +522,15 @@ type Config struct {
 	// Defaults to 0.
 	DistributedTracingSamplingRatePerMillion int `json:"distributed-tracing-sampling-rate"`
 
+	// ExperimentalEnableUdpSidechannel enables the UDP sidechannel for P4 switch read gating.
+	ExperimentalEnableUdpSidechannel bool `json:"experimental-enable-udp-sidechannel"`
+	// ExperimentalUdpSidechannelIP is the local IP address the UDP sidechannel listens on.
+	ExperimentalUdpSidechannelIP string `json:"experimental-udp-sidechannel-ip"`
+	// ExperimentalUdpSidechannelPort is the port the UDP sidechannel listens on.
+	ExperimentalUdpSidechannelPort int `json:"experimental-udp-sidechannel-port"`
+	// ExperimentalUdpSidechannelMagic is the 16-bit magic number for the UDP sidechannel protocol.
+	ExperimentalUdpSidechannelMagic int `json:"experimental-udp-sidechannel-magic"`
+
 	// ExperimentalPeerSkipClientSanVerification determines whether to skip verification of SAN field
 	// in client certificate for peer connections.
 	// TODO: Delete in v3.7
@@ -904,6 +913,12 @@ func (cfg *Config) AddFlags(fs *flag.FlagSet) {
 
 	fs.IntVar(&cfg.ExperimentalDistributedTracingSamplingRatePerMillion, "experimental-distributed-tracing-sampling-rate", 0, "Number of samples to collect per million spans for OpenTelemetry Tracing (if enabled with experimental-enable-distributed-tracing flag). Deprecated in v3.6 and will be decommissioned in v3.7. Use --distributed-tracing-sampling-rate instead.")
 	fs.IntVar(&cfg.DistributedTracingSamplingRatePerMillion, "distributed-tracing-sampling-rate", 0, "Number of samples to collect per million spans for OpenTelemetry Tracing (if enabled with enable-distributed-tracing flag).")
+
+	// experimental udp sidechannel
+	fs.BoolVar(&cfg.ExperimentalEnableUdpSidechannel, "experimental-enable-udp-sidechannel", false, "Enable UDP sidechannel for P4 switch read gating.")
+	fs.StringVar(&cfg.ExperimentalUdpSidechannelIP, "experimental-udp-sidechannel-ip", "", "Local IP address the UDP sidechannel listens on.")
+	fs.IntVar(&cfg.ExperimentalUdpSidechannelPort, "experimental-udp-sidechannel-port", 0, "UDP port the sidechannel listens on.")
+	fs.IntVar(&cfg.ExperimentalUdpSidechannelMagic, "experimental-udp-sidechannel-magic", 0, "16-bit magic number for UDP sidechannel protocol.")
 
 	// auth
 	fs.StringVar(&cfg.AuthToken, "auth-token", cfg.AuthToken, "Specify auth token specific options.")

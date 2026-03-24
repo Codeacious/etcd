@@ -32,6 +32,7 @@ import (
 	"go.etcd.io/etcd/pkg/v3/traceutil"
 	"go.etcd.io/etcd/server/v3/auth"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/membership"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/rafthttp"
 	apply2 "go.etcd.io/etcd/server/v3/etcdserver/apply"
 	"go.etcd.io/etcd/server/v3/etcdserver/errors"
 	"go.etcd.io/etcd/server/v3/etcdserver/txn"
@@ -40,6 +41,7 @@ import (
 	"go.etcd.io/etcd/server/v3/lease/leasehttp"
 	"go.etcd.io/etcd/server/v3/storage/mvcc"
 	"go.etcd.io/raft/v3"
+	"google.golang.org/grpc/metadata"
 )
 
 const (
@@ -941,8 +943,13 @@ func uint64ToBigEndianBytes(number uint64) []byte {
 func (s *EtcdServer) sendReadIndex(requestIndex uint64) error {
 	ctxToSend := uint64ToBigEndianBytes(requestIndex)
 
+	switchIndex := uint64(0)
+	if s.udpSideC != nil {
+		switchIndex = s.udpSideC.LatestSwitchIndex()
+	}
+
 	cctx, cancel := context.WithTimeout(context.Background(), s.Cfg.ReqTimeout())
-	err := s.r.ReadIndex(cctx, ctxToSend)
+	err := s.r.ReadIndexSwitchHint(cctx, ctxToSend, switchIndex)
 	cancel()
 	if errorspkg.Is(err, raft.ErrStopped) {
 		return err
@@ -961,6 +968,20 @@ func (s *EtcdServer) LinearizableReadNotify(ctx context.Context) error {
 }
 
 func (s *EtcdServer) linearizableReadNotify(ctx context.Context) error {
+	// P4 switch read gate: if the request carries a proxy-supplied marker, block
+	// until the switch confirms its saved ack index (via a tagged UDP response).
+	// Only non-leader nodes that are asking for a read lease need to gate.
+	if s.udpSideC != nil && !s.isLeader() && s.r.IsAskingForReadLease() {
+		if md, ok := metadata.FromIncomingContext(ctx); ok {
+			if marker := rafthttp.ExtractReadGateMarker(md); marker != 0 {
+				_, err := s.udpSideC.WaitForReadGate(ctx, marker)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
 	s.readMu.RLock()
 	nc := s.readNotifier
 	s.readMu.RUnlock()

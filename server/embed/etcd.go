@@ -235,6 +235,10 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
 		MaxLearners:                       cfg.MaxLearners,
 		V2Deprecation:                     cfg.V2DeprecationEffective(),
 		ExperimentalLocalAddress:          cfg.InferLocalAddr(),
+		ExperimentalEnableUdpSidechannel:  cfg.ExperimentalEnableUdpSidechannel,
+		ExperimentalUdpSidechannelIP:      cfg.ExperimentalUdpSidechannelIP,
+		ExperimentalUdpSidechannelPort:    cfg.ExperimentalUdpSidechannelPort,
+		ExperimentalUdpSidechannelMagic:   uint16(cfg.ExperimentalUdpSidechannelMagic),
 		ServerFeatureGate:                 cfg.ServerFeatureGate,
 		Metrics:                           cfg.Metrics,
 	}

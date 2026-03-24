@@ -33,6 +33,10 @@ type Config struct {
 	// 0 disables auto-sync. By default auto-sync is disabled.
 	AutoSyncInterval time.Duration `json:"auto-sync-interval"`
 
+	// LBPolicy overrides the gRPC load-balancing policy used by this client.
+	// Leave empty to use the default ("round_robin").
+	LBPolicy string `json:"lb-policy"`
+
 	// DialTimeout is the timeout for failing to establish a connection.
 	DialTimeout time.Duration `json:"dial-timeout"`
 

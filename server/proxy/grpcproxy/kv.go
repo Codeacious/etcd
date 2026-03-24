@@ -17,25 +17,35 @@ package grpcproxy
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
+	"sync/atomic"
 
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/rafthttp"
+	txn "go.etcd.io/etcd/server/v3/etcdserver/txn"
 	"go.etcd.io/etcd/server/v3/proxy/grpcproxy/cache"
 )
 
 type kvProxy struct {
-	kv    clientv3.KV
-	cache cache.Cache
+	kv        clientv3.KV
+	cache     cache.Cache
+	udpMarker uint64 // atomic; upper 32 bits will be random
 }
 
 func NewKvProxy(c *clientv3.Client) (pb.KVServer, <-chan struct{}) {
 	kv := &kvProxy{
-		kv:    c.KV,
-		cache: cache.NewCache(cache.DefaultMaxEntries),
+		kv:        c.KV,
+		cache:     cache.NewCache(cache.DefaultMaxEntries),
+		udpMarker: 1 | (uint64(rand.Uint32()) << 32), // TODO: use a deterministic unique value, not rand
 	}
 	donec := make(chan struct{})
 	close(donec)
 	return kv, donec
+}
+
+func (p *kvProxy) nextMarker() uint64 {
+	return atomic.AddUint64(&p.udpMarker, 1)
 }
 
 func (p *kvProxy) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeResponse, error) {
@@ -51,6 +61,8 @@ func (p *kvProxy) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeRespo
 		}
 
 		cachedMisses.Inc()
+	} else {
+		ctx = rafthttp.AttachReadGateMarker(ctx, p.nextMarker())
 	}
 
 	resp, err := p.kv.Do(ctx, RangeRequestToOp(r))
@@ -101,6 +113,9 @@ func (p *kvProxy) txnToCache(reqs []*pb.RequestOp, resps []*pb.ResponseOp) {
 }
 
 func (p *kvProxy) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse, error) {
+	if txn.IsTxnReadonly(r) && !txn.IsTxnSerializable(r) {
+		ctx = rafthttp.AttachReadGateMarker(ctx, p.nextMarker())
+	}
 	op := TxnRequestToOp(r)
 	opResp, err := p.kv.Do(ctx, op)
 	if err != nil {

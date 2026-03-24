@@ -433,6 +433,7 @@ func newClient(cfg *Config) (*Client, error) {
 	}
 
 	client.resolver = resolver.New(cfg.Endpoints...)
+	client.resolver.SetLBPolicy(cfg.LBPolicy)
 
 	if len(cfg.Endpoints) < 1 {
 		client.cancel()
