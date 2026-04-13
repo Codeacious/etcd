@@ -521,23 +521,40 @@ func bootstrapRaftFromWAL(cfg config.ServerConfig, bwal *bootstrappedWAL) *boots
 	}
 }
 
-func raftConfig(cfg config.ServerConfig, id uint64, s *raft.MemoryStorage) *raft.Config {
-	return &raft.Config{
-		ID:                      id,
-		ElectionTick:            cfg.ElectionTicks,
-		HeartbeatTick:           1,
-		Storage:                 s,
-		MaxSizePerMsg:           maxSizePerMsg,
-		MaxInflightMsgs:         maxInflightMsgs,
-		CheckQuorum:             true,
-		PreVote:                 cfg.PreVote,
-		ReadOnlyOption:          raft.ReadOnlyGrantLeases,
-		ReadLeaseDurationMicros: 500000, // 500ms
-		MaxNumReadLeases:        5,
-		AskForReadLease:         true,
-		ReadLeaseCatchupMargin:  10,
-		Logger:                  NewRaftLoggerZap(cfg.Logger.Named("raft")),
+func parseReadOnlyOption(mode string) raft.ReadOnlyOption {
+	switch mode {
+	case "safe":
+		return raft.ReadOnlySafe
+	case "lease-based":
+		return raft.ReadOnlyLeaseBased
+	case "grant-leases":
+		return raft.ReadOnlyGrantLeases
+	default:
+		return raft.ReadOnlyGrantLeases
 	}
+}
+
+func raftConfig(cfg config.ServerConfig, id uint64, s *raft.MemoryStorage) *raft.Config {
+	roOption := parseReadOnlyOption(cfg.ReadOnlyMode)
+	c := &raft.Config{
+		ID:              id,
+		ElectionTick:    cfg.ElectionTicks,
+		HeartbeatTick:   1,
+		Storage:         s,
+		MaxSizePerMsg:   maxSizePerMsg,
+		MaxInflightMsgs: maxInflightMsgs,
+		CheckQuorum:     true,
+		PreVote:         cfg.PreVote,
+		ReadOnlyOption:  roOption,
+		Logger:          NewRaftLoggerZap(cfg.Logger.Named("raft")),
+	}
+	if roOption == raft.ReadOnlyGrantLeases {
+		c.ReadLeaseDurationMicros = 500000 // 500ms
+		c.MaxNumReadLeases = 5
+		c.AskForReadLease = true
+		c.ReadLeaseCatchupMargin = 10
+	}
+	return c
 }
 
 func (b *bootstrappedRaft) newRaftNode(ss *snap.Snapshotter, wal *wal.WAL, cl *membership.RaftCluster) *raftNode {

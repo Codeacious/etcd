@@ -353,6 +353,12 @@ type Config struct {
 	// an election, thus minimizing disruptions.
 	PreVote bool `json:"pre-vote"`
 
+	// ReadOnlyMode controls how linearizable read-only requests are handled.
+	// Valid values: "safe" (default quorum-based), "lease-based", "grant-leases".
+	// "safe" uses quorum reads, "lease-based" uses leader lease,
+	// "grant-leases" uses leader lease and allows granting read leases to followers.
+	ReadOnlyMode string `json:"read-only-mode"`
+
 	CORS map[string]struct{}
 
 	// HostWhitelist lists acceptable hostnames from HTTP client requests.
@@ -703,7 +709,8 @@ func NewConfig() *Config {
 		SelfSignedCertValidity: DefaultSelfSignedCertValidity,
 		TlsMinVersion:          DefaultTLSMinVersion,
 
-		PreVote: true,
+		PreVote:      true,
+		ReadOnlyMode: "grant-leases",
 
 		loggerMu:              new(sync.RWMutex),
 		logger:                nil,
@@ -846,6 +853,7 @@ func (cfg *Config) AddFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&cfg.StrictReconfigCheck, "strict-reconfig-check", cfg.StrictReconfigCheck, "Reject reconfiguration requests that would cause quorum loss.")
 
 	fs.BoolVar(&cfg.PreVote, "pre-vote", cfg.PreVote, "Enable the raft Pre-Vote algorithm to prevent disruption when a node that has been partitioned away rejoins the cluster.")
+	fs.StringVar(&cfg.ReadOnlyMode, "read-mode", cfg.ReadOnlyMode, "How linearizable reads are handled: 'safe' (quorum-based), 'lease-based' (leader lease), or 'grant-leases' (leader lease with follower read leases).")
 
 	// security
 	fs.StringVar(&cfg.ClientTLSInfo.CertFile, "cert-file", "", "Path to the client server TLS cert file.")

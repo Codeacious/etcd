@@ -219,6 +219,7 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
 		CorruptCheckTime:                  cfg.CorruptCheckTime,
 		CompactHashCheckTime:              cfg.CompactHashCheckTime,
 		PreVote:                           cfg.PreVote,
+		ReadOnlyMode:                      cfg.ReadOnlyMode,
 		Logger:                            cfg.logger,
 		ForceNewCluster:                   cfg.ForceNewCluster,
 		EnableGRPCGateway:                 cfg.EnableGRPCGateway,

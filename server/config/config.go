@@ -154,6 +154,10 @@ type ServerConfig struct {
 	// PreVote is true to enable Raft Pre-Vote.
 	PreVote bool
 
+	// ReadOnlyMode controls how linearizable read-only requests are handled.
+	// Valid values: "safe", "lease-based", "grant-leases".
+	ReadOnlyMode string
+
 	// SocketOpts are socket options passed to listener config.
 	SocketOpts transport.SocketOpts
 
