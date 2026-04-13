@@ -1723,6 +1723,11 @@ func (s *EtcdServer) getLead() uint64 {
 	return atomic.LoadUint64(&s.lead)
 }
 
+func (s *EtcdServer) getReadLeaseStats() (uint64, uint64) {
+	st := s.r.Node.Status()
+	return st.ReadLeaseStats.TimesReadLeaseUsed, st.ReadLeaseStats.TimesGotReadQuery
+}
+
 func (s *EtcdServer) LeaderChangedNotify() <-chan struct{} {
 	return s.leaderChanged.Receive()
 }
@@ -1754,6 +1759,8 @@ func (s *EtcdServer) CommittedIndex() uint64 { return s.getCommittedIndex() }
 func (s *EtcdServer) AppliedIndex() uint64 { return s.getAppliedIndex() }
 
 func (s *EtcdServer) Term() uint64 { return s.getTerm() }
+
+func (s *EtcdServer) ReadLeaseStats() (uint64, uint64) { return s.getReadLeaseStats() }
 
 type confChangeResponse struct {
 	membs        []*membership.Member

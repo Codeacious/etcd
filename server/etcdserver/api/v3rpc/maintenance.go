@@ -257,18 +257,21 @@ func (ms *maintenanceServer) Alarm(ctx context.Context, ar *pb.AlarmRequest) (*p
 func (ms *maintenanceServer) Status(ctx context.Context, ar *pb.StatusRequest) (*pb.StatusResponse, error) {
 	hdr := &pb.ResponseHeader{}
 	ms.hdr.fill(hdr)
+	timesRLUsed, timesRLGot := ms.rg.ReadLeaseStats()
 	resp := &pb.StatusResponse{
-		Header:           hdr,
-		Version:          version.Version,
-		Leader:           uint64(ms.rg.Leader()),
-		RaftIndex:        ms.rg.CommittedIndex(),
-		RaftAppliedIndex: ms.rg.AppliedIndex(),
-		RaftTerm:         ms.rg.Term(),
-		DbSize:           ms.bg.Backend().Size(),
-		DbSizeInUse:      ms.bg.Backend().SizeInUse(),
-		IsLearner:        ms.cs.IsLearner(),
-		DbSizeQuota:      ms.cg.Config().QuotaBackendBytes,
-		DowngradeInfo:    &pb.DowngradeInfo{Enabled: false},
+		Header:             hdr,
+		Version:            version.Version,
+		Leader:             uint64(ms.rg.Leader()),
+		RaftIndex:          ms.rg.CommittedIndex(),
+		RaftAppliedIndex:   ms.rg.AppliedIndex(),
+		RaftTerm:           ms.rg.Term(),
+		DbSize:             ms.bg.Backend().Size(),
+		DbSizeInUse:        ms.bg.Backend().SizeInUse(),
+		IsLearner:          ms.cs.IsLearner(),
+		DbSizeQuota:        ms.cg.Config().QuotaBackendBytes,
+		DowngradeInfo:      &pb.DowngradeInfo{Enabled: false},
+		TimesReadLeaseUsed: timesRLUsed,
+		TimesGotReadQuery:  timesRLGot,
 	}
 	if storageVersion := ms.vs.GetStorageVersion(); storageVersion != nil {
 		resp.StorageVersion = storageVersion.String()

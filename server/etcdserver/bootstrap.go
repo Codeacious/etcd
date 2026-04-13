@@ -532,7 +532,7 @@ func raftConfig(cfg config.ServerConfig, id uint64, s *raft.MemoryStorage) *raft
 		CheckQuorum:             true,
 		PreVote:                 cfg.PreVote,
 		ReadOnlyOption:          raft.ReadOnlyGrantLeases,
-		ReadLeaseDurationMicros: 200000, // 200ms
+		ReadLeaseDurationMicros: 500000, // 500ms
 		MaxNumReadLeases:        5,
 		AskForReadLease:         true,
 		ReadLeaseCatchupMargin:  10,

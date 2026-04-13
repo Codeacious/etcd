@@ -2857,6 +2857,15 @@
         "downgradeInfo": {
           "$ref": "#/definitions/etcdserverpbDowngradeInfo",
           "description": "downgradeInfo indicates if there is downgrade process."
+        },
+        "timesReadLeaseUsed": {
+          "type": "string",
+          "format": "uint64",
+          "title": "Experimental read lease stats"
+        },
+        "timesGotReadQuery": {
+          "type": "string",
+          "format": "uint64"
         }
       }
     },

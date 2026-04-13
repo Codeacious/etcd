@@ -50,6 +50,7 @@ type RaftStatusGetter interface {
 	CommittedIndex() uint64
 	AppliedIndex() uint64
 	Term() uint64
+	ReadLeaseStats() (uint64, uint64)
 }
 
 type Result struct {
