@@ -42,8 +42,8 @@ type UdpSidechannel struct {
 	stopc      chan struct{}
 	lg         *zap.Logger
 	magic      uint16
-	peers      map[types.ID]*udpPeerInfo
-	peersLock  sync.RWMutex
+	peers      sync.Map   // types.ID -> *udpPeerInfo; Load is lock-free on the streamWriter hot path
+	attachLock sync.Mutex // serializes AttachPeer/DetachPeer refcount updates only (off the hot path)
 	readGate   *SwitchReadGate
 	raft       Raft
 }
@@ -103,7 +103,6 @@ func NewUdpSidechannel(id types.ID, ip string, port int, magic uint16, r Raft, l
 		stopc:    make(chan struct{}),
 		lg:       lg,
 		magic:    magic,
-		peers:    make(map[types.ID]*udpPeerInfo),
 		readGate: &SwitchReadGate{markerSeq: 1, pendingMarkers: make(chan uint64, 256)},
 		raft:     r,
 	}
@@ -175,9 +174,7 @@ func (sc *UdpSidechannel) handleUdpSidechannelMsg(buf []byte) {
 		return
 	}
 
-	sc.peersLock.RLock()
-	defer sc.peersLock.RUnlock()
-	_, ok := sc.peers[types.ID(from)]
+	_, ok := sc.peers.Load(types.ID(from))
 	if !ok && types.ID(from) != sc.id {
 		sc.lg.Warn("received UDP sidechannel message with unknown peer ID",
 			zap.Uint64("peerID", from))
@@ -258,12 +255,11 @@ func (sc *UdpSidechannel) ProcessOutgoingMessage(m *raftpb.Message) {
 		return
 	}
 
-	sc.peersLock.RLock()
-	defer sc.peersLock.RUnlock()
-	peer, ok := sc.peers[types.ID(m.To)]
+	v, ok := sc.peers.Load(types.ID(m.To))
 	if !ok {
 		return
 	}
+	peer := v.(*udpPeerInfo)
 
 	sideChannelMsg := udpSidechannelMsg{remote: peer.remote, peerID: peer.id}
 	switch m.Type {
@@ -346,15 +342,12 @@ func (sc *UdpSidechannel) querySwitchIndexLoop() {
 // The node's ToR should reflect this marker back in a MsgAskAckIndexResp
 // with the switch's ack index.
 func (sc *UdpSidechannel) QuerySwitchIndex(marker uint64) error {
-	sc.peersLock.RLock()
-	defer sc.peersLock.RUnlock()
-
 	// Pick any connected peer
 	var peer *udpPeerInfo
-	for _, p := range sc.peers {
-		peer = p
-		break
-	}
+	sc.peers.Range(func(_, v any) bool {
+		peer = v.(*udpPeerInfo)
+		return false
+	})
 	if peer == nil {
 		sc.lg.Warn("no connected peers for UDP sidechannel switch index query")
 		return fmt.Errorf("no connected peers for switch index query")
@@ -402,53 +395,58 @@ func (sc *UdpSidechannel) AttachPeer(id types.ID, ipStr string, portStr string, 
 		return
 	}
 
-	sc.peersLock.Lock()
-	defer sc.peersLock.Unlock()
-	peer, ok := sc.peers[id]
-	if ok {
-		peer.refcount++
-		if !peer.remote.IP.Equal(ip) || peer.remote.Port != port || peer.magic != magic {
-			sc.lg.Warn("UDP sidechannel peer info changed for peer, updating",
-				zap.String("peerID", id.String()),
-				zap.String("oldIP", peer.remote.IP.String()),
-				zap.Int("oldPort", peer.remote.Port),
-				zap.String("oldMagic", fmt.Sprintf("%04x", peer.magic)),
-				zap.String("newIP", ipStr),
-				zap.String("newPort", portStr),
-				zap.String("newMagic", magicStr))
-		} else {
-			return
-		}
-	}
 	remote := &net.UDPAddr{
 		IP:   ip,
 		Port: port,
 	}
 
-	if peer == nil {
-		peer = &udpPeerInfo{
-			id:       id,
-			remote:   remote,
-			magic:    magic,
-			refcount: 1,
+	sc.attachLock.Lock()
+	defer sc.attachLock.Unlock()
+	if v, ok := sc.peers.Load(id); ok {
+		peer := v.(*udpPeerInfo)
+		if peer.remote.IP.Equal(ip) && peer.remote.Port == port && peer.magic == magic {
+			peer.refcount++
+			return
 		}
-		sc.peers[id] = peer
-	} else {
-		peer.remote = remote
-		peer.magic = magic
+		sc.lg.Warn("UDP sidechannel peer info changed for peer, updating",
+			zap.String("peerID", id.String()),
+			zap.String("oldIP", peer.remote.IP.String()),
+			zap.Int("oldPort", peer.remote.Port),
+			zap.String("oldMagic", fmt.Sprintf("%04x", peer.magic)),
+			zap.String("newIP", ipStr),
+			zap.String("newPort", portStr),
+			zap.String("newMagic", magicStr))
+		// Hot-path readers access peer fields without a lock, so publish a fresh
+		// immutable struct rather than mutating the existing one in place.
+		sc.peers.Store(id, &udpPeerInfo{
+			id:            id,
+			remote:        remote,
+			magic:         magic,
+			refcount:      peer.refcount + 1,
+			lastSentIndex: atomic.LoadUint64(&peer.lastSentIndex),
+		})
+		return
 	}
+
+	sc.peers.Store(id, &udpPeerInfo{
+		id:       id,
+		remote:   remote,
+		magic:    magic,
+		refcount: 1,
+	})
 }
 
 func (sc *UdpSidechannel) DetachPeer(id types.ID) {
-	sc.peersLock.Lock()
-	defer sc.peersLock.Unlock()
-	peer, ok := sc.peers[id]
+	sc.attachLock.Lock()
+	defer sc.attachLock.Unlock()
+	v, ok := sc.peers.Load(id)
 	if !ok {
 		return
 	}
+	peer := v.(*udpPeerInfo)
 	peer.refcount--
 	if peer.refcount <= 0 {
-		delete(sc.peers, id)
+		sc.peers.Delete(id)
 	}
 }
 
