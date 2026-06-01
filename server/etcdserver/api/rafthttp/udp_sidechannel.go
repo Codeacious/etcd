@@ -28,39 +28,38 @@ const (
 	// UDP sidechannel protocol header.
 	DefaultUdpSidechannelMagic uint16 = 0xFEED
 
-	// ReadGateMarkerMetaKey is the gRPC metadata key carrying the per-request
-	// read gate marker set by grpc_proxy for P4 switch-gated linearizable reads.
-	ReadGateMarkerMetaKey = "x-etcd-read-gate-marker"
-
 	ReadGateAskTimeoutMillis = 3
 )
 
 type UdpSidechannel struct {
-	id        types.ID
-	conn      *net.UDPConn
-	listen    *net.UDPAddr
-	out       chan udpSidechannelMsg
-	ctx       context.Context
-	cancel    context.CancelFunc
-	stopc     chan struct{}
-	lg        *zap.Logger
-	magic     uint16
-	peers     map[types.ID]*udpPeerInfo
-	peersLock sync.RWMutex
-	readGate  *SwitchReadGate
-	raft      Raft
+	id         types.ID
+	conn       *net.UDPConn
+	listen     *net.UDPAddr
+	out        chan udpSidechannelMsg
+	outDropped uint64 // atomic: count of messages dropped because out was full
+	ctx        context.Context
+	cancel     context.CancelFunc
+	stopc      chan struct{}
+	lg         *zap.Logger
+	magic      uint16
+	peers      map[types.ID]*udpPeerInfo
+	peersLock  sync.RWMutex
+	readGate   *SwitchReadGate
+	raft       Raft
 }
 
 type udpPeerInfo struct {
-	id       types.ID
-	remote   *net.UDPAddr
-	magic    uint16
-	refcount int
+	id            types.ID
+	remote        *net.UDPAddr
+	magic         uint16
+	refcount      int
+	lastSentIndex uint64 // atomic: highest MsgApp proposed index emitted to the switch
 }
 
 type udpSidechannelMsg struct {
-	msg  [35]byte
-	peer *udpPeerInfo
+	msg    [35]byte
+	remote *net.UDPAddr
+	peerID types.ID
 }
 
 type SwitchReadGate struct {
@@ -111,6 +110,7 @@ func NewUdpSidechannel(id types.ID, ip string, port int, magic uint16, r Raft, l
 	sc.ctx, sc.cancel = context.WithCancel(context.Background())
 
 	go sc.readLoop()
+	go sc.sendLoop()
 	go sc.querySwitchIndexLoop()
 	return sc
 }
@@ -126,7 +126,6 @@ func (sc *UdpSidechannel) readLoop() {
 	for {
 		select {
 		case <-sc.ctx.Done():
-			close(sc.out)
 			close(sc.stopc)
 			return
 		default:
@@ -223,18 +222,33 @@ func (sc *UdpSidechannel) handleUdpSidechannelMsg(buf []byte) {
 	}
 }
 
-func (sc *UdpSidechannel) Flush() {
+func (sc *UdpSidechannel) sendLoop() {
 	for {
 		select {
 		case msg := <-sc.out:
-			_, err := sc.conn.WriteToUDP(msg.msg[:], msg.peer.remote)
+			_, err := sc.conn.WriteToUDP(msg.msg[:], msg.remote)
 			if err != nil {
 				sc.lg.Warn("failed to send UDP sidechannel message",
-					zap.String("peerID", msg.peer.id.String()),
+					zap.String("peerID", msg.peerID.String()),
 					zap.Error(err))
 			}
-		default:
+		case <-sc.ctx.Done():
 			return
+		}
+	}
+}
+
+// enqueue hands a message to the sender goroutine without ever blocking the
+// caller (the raft streamWriter). The switch hint is best-effort, so if the
+// channel is full we drop and count rather than stall replication.
+func (sc *UdpSidechannel) enqueue(msg udpSidechannelMsg) {
+	select {
+	case sc.out <- msg:
+	default:
+		if n := atomic.AddUint64(&sc.outDropped, 1); n%128 == 1 {
+			sc.lg.Warn("UDP sidechannel out channel full, dropping switch hint",
+				zap.String("peerID", msg.peerID.String()),
+				zap.Uint64("totalDropped", n))
 		}
 	}
 }
@@ -251,25 +265,28 @@ func (sc *UdpSidechannel) ProcessOutgoingMessage(m *raftpb.Message) {
 		return
 	}
 
-	if len(sc.out) >= cap(sc.out)-1 {
-		sc.lg.Warn("UDP sidechannel out channel full, flushing before adding new message",
-			zap.String("peerID", peer.id.String()))
-		sc.peersLock.RUnlock()
-		sc.Flush()
-		sc.peersLock.RLock()
-	}
-
-	sideChannelMsg := udpSidechannelMsg{peer: peer}
+	sideChannelMsg := udpSidechannelMsg{remote: peer.remote, peerID: peer.id}
 	switch m.Type {
 	case raftpb.MsgApp:
 		proposedIndex := m.Index + uint64(len(m.Entries))
+		// The switch only needs the latest proposed index for a peer.
+		// Skip MsgApps that don't advance it.
+		for {
+			last := atomic.LoadUint64(&peer.lastSentIndex)
+			if proposedIndex <= last {
+				return
+			}
+			if atomic.CompareAndSwapUint64(&peer.lastSentIndex, last, proposedIndex) {
+				break
+			}
+		}
 		binary.BigEndian.PutUint16(sideChannelMsg.msg[0:2], peer.magic)
 		sideChannelMsg.msg[2] = byte(raftpb.MsgApp)
 		binary.BigEndian.PutUint64(sideChannelMsg.msg[3:11], uint64(peer.id))
 		binary.BigEndian.PutUint64(sideChannelMsg.msg[11:19], uint64(sc.id))
 		binary.BigEndian.PutUint64(sideChannelMsg.msg[19:27], 0)
 		binary.BigEndian.PutUint64(sideChannelMsg.msg[27:35], proposedIndex)
-		sc.out <- sideChannelMsg
+		sc.enqueue(sideChannelMsg)
 	case raftpb.MsgAskAckIndex:
 		binary.BigEndian.PutUint16(sideChannelMsg.msg[0:2], peer.magic)
 		sideChannelMsg.msg[2] = byte(raftpb.MsgAskAckIndex)
@@ -277,7 +294,7 @@ func (sc *UdpSidechannel) ProcessOutgoingMessage(m *raftpb.Message) {
 		binary.BigEndian.PutUint64(sideChannelMsg.msg[11:19], uint64(sc.id))
 		binary.BigEndian.PutUint64(sideChannelMsg.msg[19:27], 0)
 		binary.BigEndian.PutUint64(sideChannelMsg.msg[27:35], 0)
-		sc.out <- sideChannelMsg
+		sc.enqueue(sideChannelMsg)
 	default:
 		sc.lg.Error("Somehow got to default case of ProcessOutgoingMessage(), should never happen")
 	}
@@ -453,17 +470,6 @@ func MagicFromStr(s string) (uint16, error) {
 		return 0, err
 	}
 	return uint16(val), nil
-}
-
-func EncodeReadGateMsg(magic uint16, fromID, toID, marker uint64) [35]byte {
-	var msg [35]byte
-	binary.BigEndian.PutUint16(msg[0:2], magic)
-	msg[2] = byte(raftpb.MsgReadIndex)
-	binary.BigEndian.PutUint64(msg[3:11], toID)
-	binary.BigEndian.PutUint64(msg[11:19], fromID)
-	binary.BigEndian.PutUint64(msg[19:27], marker)
-	binary.BigEndian.PutUint64(msg[27:35], ^uint64(0))
-	return msg
 }
 
 // Blocks until a tagged UDP response for the given marker

@@ -185,9 +185,6 @@ func (cw *streamWriter) run() {
 				batched = 0
 				sentBytes.WithLabelValues(cw.peerID.String()).Add(float64(unflushed))
 				unflushed = 0
-				if cw.udpSideC != nil {
-					cw.udpSideC.Flush()
-				}
 				continue
 			}
 
@@ -219,9 +216,6 @@ func (cw *streamWriter) run() {
 					sentBytes.WithLabelValues(cw.peerID.String()).Add(float64(unflushed))
 					unflushed = 0
 					batched = 0
-					if cw.udpSideC != nil {
-						cw.udpSideC.Flush()
-					}
 				} else {
 					batched++
 				}

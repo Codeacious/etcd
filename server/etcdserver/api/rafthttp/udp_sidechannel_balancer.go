@@ -1,12 +1,11 @@
 package rafthttp
 
 import (
-	"context"
 	"math/rand/v2"
 	"net"
-	"strconv"
 	"sync/atomic"
 
+	"go.etcd.io/etcd/client/v3/sidechannel"
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/base"
 	"google.golang.org/grpc/metadata"
@@ -74,30 +73,11 @@ func (p *udpSidechannelBalancer) Pick(info balancer.PickInfo) (balancer.PickResu
 	pick := p.picks[int(n-1)%len(p.picks)]
 
 	if md, ok := metadata.FromOutgoingContext(info.Ctx); ok {
-		if marker := ExtractReadGateMarker(md); marker != 0 {
-			msg := EncodeReadGateMsg(p.b.magic, p.b.fromID, 0, marker)
+		if marker := sidechannel.ExtractReadGateMarker(md); marker != 0 {
+			msg := sidechannel.EncodeReadGateMsg(p.b.magic, p.b.fromID, 0, marker)
 			p.b.conn.WriteToUDP(msg[:], pick.udpAddr)
 		}
 	}
 
 	return balancer.PickResult{SubConn: pick.sc}, nil
-}
-
-// Attaches the read-gate marker to the outgoing gRPC ctx metadata.
-// Should be called for any outgoing linearizable read.
-func AttachReadGateMarker(ctx context.Context, marker uint64) context.Context {
-	return metadata.AppendToOutgoingContext(ctx,
-		ReadGateMarkerMetaKey, strconv.FormatUint(marker, 10))
-}
-
-// Parses the read-gate marker from gRPC metadata.
-// Use the appropriate extraction function before calling this.
-// (metadata.FromIncomingContext on the server, metadata.FromOutgoingContext on the client)
-func ExtractReadGateMarker(md metadata.MD) uint64 {
-	vals := md.Get(ReadGateMarkerMetaKey)
-	if len(vals) == 0 {
-		return 0
-	}
-	v, _ := strconv.ParseUint(vals[0], 10, 64)
-	return v
 }

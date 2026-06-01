@@ -22,7 +22,7 @@ import (
 
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/server/v3/etcdserver/api/rafthttp"
+	"go.etcd.io/etcd/client/v3/sidechannel"
 	txn "go.etcd.io/etcd/server/v3/etcdserver/txn"
 	"go.etcd.io/etcd/server/v3/proxy/grpcproxy/cache"
 )
@@ -62,7 +62,7 @@ func (p *kvProxy) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeRespo
 
 		cachedMisses.Inc()
 	} else {
-		ctx = rafthttp.AttachReadGateMarker(ctx, p.nextMarker())
+		ctx = sidechannel.AttachReadGateMarker(ctx, p.nextMarker())
 	}
 
 	resp, err := p.kv.Do(ctx, RangeRequestToOp(r))
@@ -114,7 +114,7 @@ func (p *kvProxy) txnToCache(reqs []*pb.RequestOp, resps []*pb.ResponseOp) {
 
 func (p *kvProxy) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse, error) {
 	if txn.IsTxnReadonly(r) && !txn.IsTxnSerializable(r) {
-		ctx = rafthttp.AttachReadGateMarker(ctx, p.nextMarker())
+		ctx = sidechannel.AttachReadGateMarker(ctx, p.nextMarker())
 	}
 	op := TxnRequestToOp(r)
 	opResp, err := p.kv.Do(ctx, op)

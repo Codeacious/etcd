@@ -32,7 +32,7 @@ import (
 	"go.etcd.io/etcd/pkg/v3/traceutil"
 	"go.etcd.io/etcd/server/v3/auth"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/membership"
-	"go.etcd.io/etcd/server/v3/etcdserver/api/rafthttp"
+	"go.etcd.io/etcd/client/v3/sidechannel"
 	apply2 "go.etcd.io/etcd/server/v3/etcdserver/apply"
 	"go.etcd.io/etcd/server/v3/etcdserver/errors"
 	"go.etcd.io/etcd/server/v3/etcdserver/txn"
@@ -973,7 +973,7 @@ func (s *EtcdServer) linearizableReadNotify(ctx context.Context) error {
 	// Only non-leader nodes that are asking for a read lease need to gate.
 	if s.udpSideC != nil && !s.isLeader() && s.r.IsAskingForReadLease() {
 		if md, ok := metadata.FromIncomingContext(ctx); ok {
-			if marker := rafthttp.ExtractReadGateMarker(md); marker != 0 {
+			if marker := sidechannel.ExtractReadGateMarker(md); marker != 0 {
 				_, err := s.udpSideC.WaitForReadGate(ctx, marker)
 				if err != nil {
 					return err
