@@ -66,6 +66,12 @@ func (*fakeRaftStatusGetter) AppliedIndex() uint64 {
 	return 0
 }
 
+// ReadLeaseStats is a read-lease fork addition to RaftStatusGetter; the applier
+// only forwards these counters into StatusResponse, so zeroes are correct here.
+func (*fakeRaftStatusGetter) ReadLeaseStats() (uint64, uint64) {
+	return 0, 0
+}
+
 func (*fakeRaftStatusGetter) Term() uint64 {
 	return 0
 }

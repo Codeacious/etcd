@@ -17,7 +17,6 @@ package grpcproxy
 import (
 	"context"
 	"errors"
-	"math/rand/v2"
 	"sync/atomic"
 
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
@@ -30,14 +29,15 @@ import (
 type kvProxy struct {
 	kv        clientv3.KV
 	cache     cache.Cache
-	udpMarker uint64 // atomic; upper 32 bits will be random
+	udpMarker uint64 // atomic; upper 32 bits randomized but nonzero (see sidechannel.NewMarkerSeed)
 }
 
 func NewKvProxy(c *clientv3.Client) (pb.KVServer, <-chan struct{}) {
 	kv := &kvProxy{
-		kv:        c.KV,
-		cache:     cache.NewCache(cache.DefaultMaxEntries),
-		udpMarker: 1 | (uint64(rand.Uint32()) << 32), // TODO: use a deterministic unique value, not rand
+		kv:    c.KV,
+		cache: cache.NewCache(cache.DefaultMaxEntries),
+		// TODO: use a deterministic unique value, not rand
+		udpMarker: sidechannel.NewMarkerSeed(),
 	}
 	donec := make(chan struct{})
 	close(donec)

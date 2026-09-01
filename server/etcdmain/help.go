@@ -121,6 +121,8 @@ Clustering:
   --initial-cluster-token 'etcd-cluster'
     Initial cluster token for the etcd cluster during bootstrap.
     Specifying this can protect you from unintended cross-cluster interaction when running multiple clusters.
+  --read-mode 'safe'
+    How linearizable reads are handled: 'safe' (quorum-based), 'lease-based' (leader lease), or 'grant-leases' (leader lease with follower read leases).
   --advertise-client-urls 'http://localhost:2379'
     List of this member's client URLs to advertise to the public.
     The client URLs advertised should be accessible to machines that talk to etcd cluster. etcd client libraries parse these URLs to connect to the cluster.
@@ -341,6 +343,14 @@ Experimental feature:
     Number of entries for a slow follower to catch up after compacting the raft storage entries.
   --experimental-stop-grpc-service-on-defrag
     Enable etcd gRPC service to stop serving client requests on defragmentation. Deprecated in v3.6 and will be decommissioned in v3.7. Use '--feature-gates=StopGRPCServiceOnDefrag=true' instead.
+  --experimental-enable-udp-sidechannel 'false'
+    Enable UDP sidechannel for P4 switch read gating. Only meaningful with '--read-mode grant-leases'.
+  --experimental-udp-sidechannel-ip ''
+    Local IP address the UDP sidechannel listens on.
+  --experimental-udp-sidechannel-port '0'
+    UDP port the sidechannel listens on. 0 uses the built-in default (7700).
+  --experimental-udp-sidechannel-magic '0'
+    16-bit magic number for UDP sidechannel protocol. 0 uses the built-in default (0xFEED).
 
 Unsafe feature:
   --force-new-cluster 'false'

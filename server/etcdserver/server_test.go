@@ -1424,7 +1424,16 @@ func (n *nodeRecorder) Status() raft.Status                                     
 func (n *nodeRecorder) Ready() <-chan raft.Ready                                        { return nil }
 func (n *nodeRecorder) TransferLeadership(ctx context.Context, lead, transferee uint64) {}
 func (n *nodeRecorder) ReadIndex(ctx context.Context, rctx []byte) error                { return nil }
-func (n *nodeRecorder) Advance()                                                        {}
+
+// Read-lease fork additions to raft.Node. Both are inert here: no test in this
+// package drives the follower-lease path, and a recorder that never asks for a
+// lease is the behaviour the existing assertions were written against.
+// Promoted to *readyNode and *nodeConfChangeCommitterRecorder via embedding.
+func (n *nodeRecorder) ReadIndexSwitchHint(ctx context.Context, rctx []byte, switchIndex uint64) error {
+	return nil
+}
+func (n *nodeRecorder) IsAskingForReadLease() bool { return false }
+func (n *nodeRecorder) Advance()                   {}
 func (n *nodeRecorder) ApplyConfChange(conf raftpb.ConfChangeI) *raftpb.ConfState {
 	n.Record(testutil.Action{Name: "ApplyConfChange", Params: []any{conf}})
 	return &raftpb.ConfState{}

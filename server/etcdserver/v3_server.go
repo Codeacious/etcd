@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	errorspkg "errors"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
@@ -29,10 +30,10 @@ import (
 
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/version"
+	"go.etcd.io/etcd/client/v3/sidechannel"
 	"go.etcd.io/etcd/pkg/v3/traceutil"
 	"go.etcd.io/etcd/server/v3/auth"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/membership"
-	"go.etcd.io/etcd/client/v3/sidechannel"
 	apply2 "go.etcd.io/etcd/server/v3/etcdserver/apply"
 	"go.etcd.io/etcd/server/v3/etcdserver/errors"
 	"go.etcd.io/etcd/server/v3/etcdserver/txn"
@@ -804,6 +805,50 @@ func (s *EtcdServer) processInternalRaftRequestOnce(ctx context.Context, r pb.In
 // Watchable returns a watchable interface attached to the etcdserver.
 func (s *EtcdServer) Watchable() mvcc.WatchableKV { return s.KV() }
 
+// Because etcd batches linearized reads together before getting a read index from Raft,
+// we'll have N switch-supplied hints for N batched reads when using the full-assist mode.
+// We can't solve this without getting ugly- either by removing batching,
+// or by dragging some portion of the linearizability condition checking out of Raft into etcd.
+// captureReadNotifier does a CAS against the current pending read hint for a batch, ensuring we
+// have the max value (i.e. the highest commit log requirement)
+// for a batched read index request into Raft.
+// This unfortunately means that if a single switchHint cannot be obtained for a batch,
+// the ENTIRE batch gets forwarded to the leader. Meaning, as reads scale up, the chance
+// of a batch getting forwarded goes up.
+//
+// readMu is used to ensure that readNotifier and pendingReadHint are in sync.
+// Otherwise, readNotifier can be swapped while capturing pendingReadHint, leading
+// to a read being answered by a notifier in a batch that didn't have that read's switch hint.
+//
+// TODO: A switchHint of MaxUint64 (failed switch index lookup) will cause that read to be
+// "removed" from a batch, placing it into a separate "forwarding" batch, separating out failures.
+// This also provides an angle for tracking failed switch index lookups.
+func (s *EtcdServer) captureReadNotifier(switchHint uint64) *notifier {
+	s.readMu.RLock()
+	defer s.readMu.RUnlock()
+	nc := s.readNotifier
+	for switchHint != 0 {
+		cur := atomic.LoadUint64(&s.pendingReadHint)
+		if cur >= switchHint || atomic.CompareAndSwapUint64(&s.pendingReadHint, cur, switchHint) {
+			break
+		}
+	}
+	return nc
+}
+
+// Gets the read hint for a batch, clears it, and sets up the next notifier for the next batch.
+// Using readMu here ensures the readNotifier will only be for reads that have their switchHint
+// captured in pendingReadHint.
+func (s *EtcdServer) swapReadNotifier() (*notifier, uint64) {
+	nextnr := newNotifier()
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	nr := s.readNotifier
+	switchHint := atomic.SwapUint64(&s.pendingReadHint, 0)
+	s.readNotifier = nextnr
+	return nr, switchHint
+}
+
 func (s *EtcdServer) linearizableReadLoop() {
 	for {
 		requestID := s.reqIDGen.Next()
@@ -820,13 +865,9 @@ func (s *EtcdServer) linearizableReadLoop() {
 		// to propagate the trace from Txn or Range.
 		trace := traceutil.New("linearizableReadLoop", s.Logger())
 
-		nextnr := newNotifier()
-		s.readMu.Lock()
-		nr := s.readNotifier
-		s.readNotifier = nextnr
-		s.readMu.Unlock()
+		nr, switchHint := s.swapReadNotifier()
 
-		confirmedIndex, err := s.requestCurrentIndex(leaderChangedNotifier, requestID)
+		confirmedIndex, err := s.requestCurrentIndex(leaderChangedNotifier, requestID, switchHint)
 		if isStopped(err) {
 			return
 		}
@@ -861,8 +902,8 @@ func isStopped(err error) bool {
 	return errorspkg.Is(err, raft.ErrStopped) || errorspkg.Is(err, errors.ErrStopped)
 }
 
-func (s *EtcdServer) requestCurrentIndex(leaderChangedNotifier <-chan struct{}, requestID uint64) (uint64, error) {
-	err := s.sendReadIndex(requestID)
+func (s *EtcdServer) requestCurrentIndex(leaderChangedNotifier <-chan struct{}, requestID, switchHint uint64) (uint64, error) {
+	err := s.sendReadIndex(requestID, switchHint)
 	if err != nil {
 		return 0, err
 	}
@@ -903,7 +944,7 @@ func (s *EtcdServer) requestCurrentIndex(leaderChangedNotifier <-chan struct{}, 
 		case <-firstCommitInTermNotifier:
 			firstCommitInTermNotifier = s.firstCommitInTerm.Receive()
 			lg.Info("first commit in current term: resending ReadIndex request")
-			err := s.sendReadIndex(requestID)
+			err := s.sendReadIndex(requestID, switchHint)
 			if err != nil {
 				return 0, err
 			}
@@ -915,7 +956,7 @@ func (s *EtcdServer) requestCurrentIndex(leaderChangedNotifier <-chan struct{}, 
 				zap.Uint64("sent-request-id", requestID),
 				zap.Duration("retry-timeout", readIndexRetryTime),
 			)
-			err := s.sendReadIndex(requestID)
+			err := s.sendReadIndex(requestID, switchHint)
 			if err != nil {
 				return 0, err
 			}
@@ -940,16 +981,11 @@ func uint64ToBigEndianBytes(number uint64) []byte {
 	return byteResult
 }
 
-func (s *EtcdServer) sendReadIndex(requestIndex uint64) error {
+func (s *EtcdServer) sendReadIndex(requestIndex, switchHint uint64) error {
 	ctxToSend := uint64ToBigEndianBytes(requestIndex)
 
-	switchIndex := uint64(0)
-	if s.udpSideC != nil {
-		switchIndex = s.udpSideC.LatestSwitchIndex()
-	}
-
 	cctx, cancel := context.WithTimeout(context.Background(), s.Cfg.ReqTimeout())
-	err := s.r.ReadIndexSwitchHint(cctx, ctxToSend, switchIndex)
+	err := s.r.ReadIndexSwitchHint(cctx, ctxToSend, switchHint)
 	cancel()
 	if errorspkg.Is(err, raft.ErrStopped) {
 		return err
@@ -968,23 +1004,28 @@ func (s *EtcdServer) LinearizableReadNotify(ctx context.Context) error {
 }
 
 func (s *EtcdServer) linearizableReadNotify(ctx context.Context) error {
-	// P4 switch read gate: if the request carries a proxy-supplied marker, block
-	// until the switch confirms its saved ack index (via a tagged UDP response).
-	// Only non-leader nodes that are asking for a read lease need to gate.
+	// Every follower gates reads here in assist/UDP sidechannel mode by blocking until the switch
+	// answers with its current proposed log index for that read.
+	// This is done by matching the client-supplied marker for the read against
+	// a client-driven UDP packet containing the same marker that is tagged by the switch
+	// with the switch's index. If the marker doesn't arrive, the UDP sidechannel system
+	// queries the switch itself for a current index.
+	switchHint := uint64(0)
 	if s.udpSideC != nil && !s.isLeader() && s.r.IsAskingForReadLease() {
+		marker := uint64(0)
 		if md, ok := metadata.FromIncomingContext(ctx); ok {
-			if marker := sidechannel.ExtractReadGateMarker(md); marker != 0 {
-				_, err := s.udpSideC.WaitForReadGate(ctx, marker)
-				if err != nil {
-					return err
-				}
-			}
+			marker = sidechannel.ExtractReadGateMarker(md)
 		}
+		// 'h' is the index the switch's index for this read; the Raft log's commit index
+		// has to reach at least 'h' before the read can be served locally.
+		h, err := s.udpSideC.WaitForReadGate(ctx, marker)
+		if err != nil {
+			return err
+		}
+		switchHint = h
 	}
 
-	s.readMu.RLock()
-	nc := s.readNotifier
-	s.readMu.RUnlock()
+	nc := s.captureReadNotifier(switchHint)
 
 	// signal linearizable loop for current notify if it hasn't been already
 	select {

@@ -354,9 +354,10 @@ type Config struct {
 	PreVote bool `json:"pre-vote"`
 
 	// ReadOnlyMode controls how linearizable read-only requests are handled.
-	// Valid values: "safe" (default quorum-based), "lease-based", "grant-leases".
-	// "safe" uses quorum reads, "lease-based" uses leader lease,
-	// "grant-leases" uses leader lease and allows granting read leases to followers.
+	// Valid values: "safe" (quorum reads, the default and upstream's
+	// behavior), "lease-based" (leader lease), "grant-leases" (leader lease
+	// + read leases granted to followers, this fork's addition). Anything
+	// unrecognized falls back to "safe".
 	ReadOnlyMode string `json:"read-only-mode"`
 
 	CORS map[string]struct{}
@@ -710,7 +711,7 @@ func NewConfig() *Config {
 		TlsMinVersion:          DefaultTLSMinVersion,
 
 		PreVote:      true,
-		ReadOnlyMode: "grant-leases",
+		ReadOnlyMode: "safe",
 
 		loggerMu:              new(sync.RWMutex),
 		logger:                nil,

@@ -530,7 +530,7 @@ func parseReadOnlyOption(mode string) raft.ReadOnlyOption {
 	case "grant-leases":
 		return raft.ReadOnlyGrantLeases
 	default:
-		return raft.ReadOnlyGrantLeases
+		return raft.ReadOnlySafe
 	}
 }
 

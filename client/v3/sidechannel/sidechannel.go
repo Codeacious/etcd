@@ -3,14 +3,16 @@
 // light so client-side code (including out-of-tree experiment drivers) can
 // import it without pulling server-side packages.
 //
-// The 35-byte wire format is also implemented in two other places — see
-// ETCD.md ("Things to be careful about when editing"). Layout changes must
-// land here, in the P4 program, and in the rafthttp UDP listener.
+// The 35-byte wire format has exactly one other independent encoding: the P4
+// program (tack/tack-switch-agen.p4). Layout changes must land in both. The
+// rafthttp listener/balancer and the gcp client-worker consume this package
+// rather than re-implementing the layout.
 package sidechannel
 
 import (
 	"context"
 	"encoding/binary"
+	"math/rand/v2"
 	"strconv"
 
 	"google.golang.org/grpc/metadata"
@@ -29,7 +31,7 @@ const (
 
 	// DefaultMagic is the canonical 2-byte wire magic at offset [0:2] of every
 	// read-gate payload. The etcd UDP listener, the client drivers, and the P4
-	// program must all agree on it; keep the three in sync (see package doc).
+	// program must all agree on it; keep the three in sync.
 	DefaultMagic uint16 = 0xFEED
 
 	// DefaultPort is the canonical UDP port the switch listens on for read-gate
@@ -46,7 +48,7 @@ const (
 //	[3:11]  to   (peer ID)
 //	[11:19] from (peer ID)
 //	[19:27] marker
-//	[27:35] value (^uint64(0) — the switch overwrites in flight)
+//	[27:35] value (0 — the switch overwrites it in flight with its saved index)
 func EncodeReadGateMsg(magic uint16, fromID, toID, marker uint64) [35]byte {
 	var msg [35]byte
 	binary.BigEndian.PutUint16(msg[0:2], magic)
@@ -54,8 +56,19 @@ func EncodeReadGateMsg(magic uint16, fromID, toID, marker uint64) [35]byte {
 	binary.BigEndian.PutUint64(msg[3:11], toID)
 	binary.BigEndian.PutUint64(msg[11:19], fromID)
 	binary.BigEndian.PutUint64(msg[19:27], marker)
-	binary.BigEndian.PutUint64(msg[27:35], ^uint64(0))
+	binary.BigEndian.PutUint64(msg[27:35], 0)
 	return msg
+}
+
+// NewMarkerSeed returns a mask for the upper 32 bits needed for client read-gate markers.
+// The seed randomizes the upper 32 bits but forces them nonzero.
+// Upper zero markers are reserved for leader-minted markers during fallback switch queries.
+func NewMarkerSeed() uint64 {
+	upper := rand.Uint32()
+	if upper == 0 {
+		upper = 1
+	}
+	return uint64(upper)<<32 | 1
 }
 
 // AttachReadGateMarker attaches the read-gate marker to the outgoing gRPC

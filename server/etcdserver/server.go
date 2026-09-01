@@ -234,6 +234,12 @@ type EtcdServer struct {
 	// readNotifier is used to notify the read routine that it can process the request
 	// when there is no error
 	readNotifier *notifier
+	// pendingReadHint accumulates the switch index required by the readers that
+	// will be answered by the next read-index round: the max over their
+	// per-read stamps, or 0 when nothing needs a switch (every mode but assist,
+	// and leaders). See linearizableReadNotify for the handoff and why readMu
+	// is what makes it exact.
+	pendingReadHint uint64 // atomic; ordered by the readMu critical sections
 
 	// udpSideC is a reference to the UDP sidechannel for server-initiated switch queries.
 	udpSideC *rafthttp.UdpSidechannel
@@ -438,6 +444,12 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 		}
 		srv.udpSideC = rafthttp.NewUdpSidechannel(b.cluster.nodeID, ip, port,
 			magic, srv, cfg.Logger)
+		// The same condition linearizableReadNotify gates on, so the receive path
+		// parks a read-gate reflection only when some read could actually claim
+		// it. Evaluated live per packet; isLeader is one atomic load.
+		srv.udpSideC.SetGateActiveChecker(func() bool {
+			return !srv.isLeader() && srv.r.IsAskingForReadLease()
+		})
 	}
 
 	// TODO: move transport initialization near the definition of remote
@@ -572,6 +584,42 @@ func (s *EtcdServer) Start() {
 	s.GoAttach(s.monitorKVHash)
 	s.GoAttach(s.monitorCompactHash)
 	s.GoAttach(s.monitorDowngrade)
+	s.GoAttach(s.monitorSwitchRegister)
+}
+
+// switchRegisterRefreshInterval is how often the leader checks whether each
+// peer's switch has gone quiet. An idle path is refreshed every other tick (the
+// refresh's own reflection clears the check), so the effective restore latency
+// after a switch reboot is ~2x this.
+const switchRegisterRefreshInterval = 250 * time.Millisecond
+
+// monitorSwitchRegister keeps the in-path switches' saved index alive while the
+// cluster is write-idle. Only a leader taps MsgApps, so only a leader has an
+// index worth re-sending; a switch that reboots during a read-only stretch
+// would otherwise sit at 0 until the next write.
+func (s *EtcdServer) monitorSwitchRegister() {
+	if s.udpSideC == nil {
+		return
+	}
+	t := time.NewTicker(switchRegisterRefreshInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.stopping:
+			return
+		case <-t.C:
+			// Leader-only: a demoted leader still holds a lastSentIndex, and
+			// re-sending it could push a register above anything the current
+			// leader has proposed, stalling lease holders until they catch up.
+			if !s.isLeader() {
+				continue
+			}
+			// Only peers holding a read lease matter; nobody else can serve a
+			// read locally, so their switch state is irrelevant until they are
+			// granted one, and a grant re-arms the path on its own.
+			s.udpSideC.RefreshIdleSwitches(s.r.Status().ActiveReadLeases)
+		}
+	}
 }
 
 // start prepares and starts server in a new goroutine. It is no longer safe to

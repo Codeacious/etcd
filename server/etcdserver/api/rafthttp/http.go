@@ -467,8 +467,10 @@ func (h *streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				zap.String("remote-addr", r.RemoteAddr),
 				zap.String("parsed-ip", remoteAddr))
 		} else {
-			h.tr.UdpSideC.AttachPeer(from, remoteAddr, udpSPortStr, udpSPortMagicStr)
-			attachedUdpPeer = true
+			// Only detach below if the peer was actually counted: AttachPeer
+			// bails without counting on an unparseable port/magic header, and
+			// detaching that would decrement another live stream's refcount.
+			attachedUdpPeer = h.tr.UdpSideC.AttachPeer(from, remoteAddr, udpSPortStr, udpSPortMagicStr)
 		}
 	}
 

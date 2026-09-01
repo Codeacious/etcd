@@ -212,9 +212,10 @@ type ServerConfig struct {
 	ExperimentalLocalAddress string `json:"experimental-local-address"`
 
 	// ExperimentalEnableUdpSidechannel enables the UDP sidechannel to allow a P4 switch
-	// to generate read-lease ACKs and mark read index requests with saved log indicies.
-	// If this is enabled, RAFT (and thus etcd) will no longer function unless a P4 switch is marking
-	// read index requests with saved log indicies from log appends.
+	// to generate read-lease ACKs and mark read index requests with saved log indices.
+	// With this enabled but no P4 switch in the data path, writes, replication,
+	// and leader reads still work; follower linearizable reads block on the
+	// read gate until the request times out and forward to the leader.
 	ExperimentalEnableUdpSidechannel bool `json:"experimental-enable-udp-sidechannel"`
 
 	// ExperimentalUdpSidechannelIP is the local IP address the UDP sidechannel
