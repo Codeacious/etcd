@@ -233,4 +233,4 @@ require (
 	mvdan.cc/unparam v0.0.0-20240528143540-8a5130ca722f // indirect
 )
 
-replace go.etcd.io/raft/v3 => /home/codeacious/raft
+replace go.etcd.io/raft/v3 => ../../../raft

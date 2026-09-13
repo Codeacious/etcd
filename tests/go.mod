@@ -107,4 +107,4 @@ require (
 	sigs.k8s.io/yaml v1.4.0 // indirect
 )
 
-replace go.etcd.io/raft/v3 => /home/codeacious/raft
+replace go.etcd.io/raft/v3 => ../../raft

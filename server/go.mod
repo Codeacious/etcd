@@ -91,4 +91,4 @@ replace go.etcd.io/etcd => ./FORBIDDEN_DEPENDENCY
 
 replace go.etcd.io/tests/v3 => ./FORBIDDEN_DEPENDENCY
 
-replace go.etcd.io/raft/v3 => /home/codeacious/raft
+replace go.etcd.io/raft/v3 => ../../raft
