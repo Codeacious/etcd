@@ -548,8 +548,13 @@ func raftConfig(cfg config.ServerConfig, id uint64, s *raft.MemoryStorage) *raft
 		ReadOnlyOption:  roOption,
 		Logger:          NewRaftLoggerZap(cfg.Logger.Named("raft")),
 	}
-	if roOption == raft.ReadOnlyGrantLeases {
+	// Both leased modes need a lease duration: the leader serves its own reads
+	// out of a self-lease in either one. Only grant-leases also hands leases to
+	// followers, so the rest stays scoped to it.
+	if roOption == raft.ReadOnlyLeaseBased || roOption == raft.ReadOnlyGrantLeases {
 		c.ReadLeaseDurationMicros = 500000 // 500ms
+	}
+	if roOption == raft.ReadOnlyGrantLeases {
 		c.MaxNumReadLeases = 5
 		c.AskForReadLease = true
 		c.ReadLeaseCatchupMargin = 10
