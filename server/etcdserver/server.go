@@ -240,6 +240,9 @@ type EtcdServer struct {
 	// and leaders). See linearizableReadNotify for the handoff and why readMu
 	// is what makes it exact.
 	pendingReadHint uint64 // atomic; ordered by the readMu critical sections
+	// pendingReadHintTerm is the term the switch stamped on those readers'
+	// hints: 0 for none yet, readHintTermMixed if they differ.
+	pendingReadHintTerm uint64 // atomic; ordered by the readMu critical sections
 
 	// udpSideC is a reference to the UDP sidechannel for server-initiated switch queries.
 	udpSideC *rafthttp.UdpSidechannel

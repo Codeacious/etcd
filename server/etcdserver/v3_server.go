@@ -20,6 +20,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	errorspkg "errors"
+	"math"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -823,7 +824,11 @@ func (s *EtcdServer) Watchable() mvcc.WatchableKV { return s.KV() }
 // TODO: A switchHint of MaxUint64 (failed switch index lookup) will cause that read to be
 // "removed" from a batch, placing it into a separate "forwarding" batch, separating out failures.
 // This also provides an angle for tracking failed switch index lookups.
-func (s *EtcdServer) captureReadNotifier(switchHint uint64) *notifier {
+//
+// hintTerm is the term the switch stamped with switchHint. Raft uses a hint only
+// in its own term (SAFE-1), so a round can carry one term: readers stamped in
+// different terms mark the round mixed, and swapReadNotifier then forwards it.
+func (s *EtcdServer) captureReadNotifier(switchHint, hintTerm uint64) *notifier {
 	s.readMu.RLock()
 	defer s.readMu.RUnlock()
 	nc := s.readNotifier
@@ -833,20 +838,52 @@ func (s *EtcdServer) captureReadNotifier(switchHint uint64) *notifier {
 			break
 		}
 	}
+	// MaxUint64 already means "do not serve locally" and needs no term.
+	if switchHint != 0 && switchHint != math.MaxUint64 {
+		mergeReadHintTerm(&s.pendingReadHintTerm, hintTerm)
+	}
 	return nc
+}
+
+// readHintTermMixed marks a round whose readers were stamped in different terms.
+const readHintTermMixed = math.MaxUint64
+
+// mergeReadHintTerm folds one reader's stamp term into its round's: the first
+// reader sets it, and any reader with a different term marks the round mixed.
+func mergeReadHintTerm(addr *uint64, term uint64) {
+	for {
+		cur := atomic.LoadUint64(addr)
+		switch {
+		case cur == term || cur == readHintTermMixed:
+			return
+		case cur == 0:
+			if atomic.CompareAndSwapUint64(addr, 0, term) {
+				return
+			}
+		default:
+			atomic.StoreUint64(addr, readHintTermMixed)
+			return
+		}
+	}
 }
 
 // Gets the read hint for a batch, clears it, and sets up the next notifier for the next batch.
 // Using readMu here ensures the readNotifier will only be for reads that have their switchHint
 // captured in pendingReadHint.
-func (s *EtcdServer) swapReadNotifier() (*notifier, uint64) {
+func (s *EtcdServer) swapReadNotifier() (nr *notifier, switchHint uint64, hintTerm uint64) {
 	nextnr := newNotifier()
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
-	nr := s.readNotifier
-	switchHint := atomic.SwapUint64(&s.pendingReadHint, 0)
+	nr = s.readNotifier
+	switchHint = atomic.SwapUint64(&s.pendingReadHint, 0)
+	hintTerm = atomic.SwapUint64(&s.pendingReadHintTerm, 0)
+	if hintTerm == readHintTermMixed {
+		// Raft can check only one term, so no reader in this round may be
+		// served on its stamp.
+		switchHint, hintTerm = math.MaxUint64, 0
+	}
 	s.readNotifier = nextnr
-	return nr, switchHint
+	return nr, switchHint, hintTerm
 }
 
 func (s *EtcdServer) linearizableReadLoop() {
@@ -865,9 +902,9 @@ func (s *EtcdServer) linearizableReadLoop() {
 		// to propagate the trace from Txn or Range.
 		trace := traceutil.New("linearizableReadLoop", s.Logger())
 
-		nr, switchHint := s.swapReadNotifier()
+		nr, switchHint, hintTerm := s.swapReadNotifier()
 
-		confirmedIndex, err := s.requestCurrentIndex(leaderChangedNotifier, requestID, switchHint)
+		confirmedIndex, err := s.requestCurrentIndex(leaderChangedNotifier, requestID, switchHint, hintTerm)
 		if isStopped(err) {
 			return
 		}
@@ -902,8 +939,8 @@ func isStopped(err error) bool {
 	return errorspkg.Is(err, raft.ErrStopped) || errorspkg.Is(err, errors.ErrStopped)
 }
 
-func (s *EtcdServer) requestCurrentIndex(leaderChangedNotifier <-chan struct{}, requestID, switchHint uint64) (uint64, error) {
-	err := s.sendReadIndex(requestID, switchHint)
+func (s *EtcdServer) requestCurrentIndex(leaderChangedNotifier <-chan struct{}, requestID, switchHint, hintTerm uint64) (uint64, error) {
+	err := s.sendReadIndex(requestID, switchHint, hintTerm)
 	if err != nil {
 		return 0, err
 	}
@@ -944,7 +981,7 @@ func (s *EtcdServer) requestCurrentIndex(leaderChangedNotifier <-chan struct{}, 
 		case <-firstCommitInTermNotifier:
 			firstCommitInTermNotifier = s.firstCommitInTerm.Receive()
 			lg.Info("first commit in current term: resending ReadIndex request")
-			err := s.sendReadIndex(requestID, switchHint)
+			err := s.sendReadIndex(requestID, switchHint, hintTerm)
 			if err != nil {
 				return 0, err
 			}
@@ -956,7 +993,7 @@ func (s *EtcdServer) requestCurrentIndex(leaderChangedNotifier <-chan struct{}, 
 				zap.Uint64("sent-request-id", requestID),
 				zap.Duration("retry-timeout", readIndexRetryTime),
 			)
-			err := s.sendReadIndex(requestID, switchHint)
+			err := s.sendReadIndex(requestID, switchHint, hintTerm)
 			if err != nil {
 				return 0, err
 			}
@@ -981,11 +1018,11 @@ func uint64ToBigEndianBytes(number uint64) []byte {
 	return byteResult
 }
 
-func (s *EtcdServer) sendReadIndex(requestIndex, switchHint uint64) error {
+func (s *EtcdServer) sendReadIndex(requestIndex, switchHint, hintTerm uint64) error {
 	ctxToSend := uint64ToBigEndianBytes(requestIndex)
 
 	cctx, cancel := context.WithTimeout(context.Background(), s.Cfg.ReqTimeout())
-	err := s.r.ReadIndexSwitchHint(cctx, ctxToSend, switchHint)
+	err := s.r.ReadIndexSwitchHint(cctx, ctxToSend, switchHint, hintTerm)
 	cancel()
 	if errorspkg.Is(err, raft.ErrStopped) {
 		return err
@@ -1010,7 +1047,7 @@ func (s *EtcdServer) linearizableReadNotify(ctx context.Context) error {
 	// a client-driven UDP packet containing the same marker that is tagged by the switch
 	// with the switch's index. If the marker doesn't arrive, the UDP sidechannel system
 	// queries the switch itself for a current index.
-	switchHint := uint64(0)
+	switchHint, hintTerm := uint64(0), uint64(0)
 	if s.udpSideC != nil && !s.isLeader() && s.r.IsAskingForReadLease() {
 		marker := uint64(0)
 		if md, ok := metadata.FromIncomingContext(ctx); ok {
@@ -1018,14 +1055,14 @@ func (s *EtcdServer) linearizableReadNotify(ctx context.Context) error {
 		}
 		// 'h' is the index the switch's index for this read; the Raft log's commit index
 		// has to reach at least 'h' before the read can be served locally.
-		h, err := s.udpSideC.WaitForReadGate(ctx, marker)
+		h, ht, err := s.udpSideC.WaitForReadGate(ctx, marker)
 		if err != nil {
 			return err
 		}
-		switchHint = h
+		switchHint, hintTerm = h, ht
 	}
 
-	nc := s.captureReadNotifier(switchHint)
+	nc := s.captureReadNotifier(switchHint, hintTerm)
 
 	// signal linearizable loop for current notify if it hasn't been already
 	select {

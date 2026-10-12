@@ -39,7 +39,10 @@ const (
 	DefaultPort = 7700
 )
 
-// EncodeReadGateMsg packs a 35-byte read-gate UDP payload.
+// MsgLen is the fixed length of every sidechannel payload.
+const MsgLen = 43
+
+// EncodeReadGateMsg packs a read-gate UDP payload.
 //
 // Layout (big-endian):
 //
@@ -48,15 +51,18 @@ const (
 //	[3:11]  to   (peer ID)
 //	[11:19] from (peer ID)
 //	[19:27] marker
-//	[27:35] value (0 — the switch overwrites it in flight with its saved index)
-func EncodeReadGateMsg(magic uint16, fromID, toID, marker uint64) [35]byte {
-	var msg [35]byte
+//	[27:35] value   (0 — the switch overwrites it in flight with its saved index)
+//	[35:39] boot ID (0 — the switch overwrites it with its own)
+//	[39:43] term    (0 — the switch overwrites it with the term of the leader
+//	                 whose write it last accepted; the server uses the value
+//	                 only in that term)
+func EncodeReadGateMsg(magic uint16, fromID, toID, marker uint64) [MsgLen]byte {
+	var msg [MsgLen]byte
 	binary.BigEndian.PutUint16(msg[0:2], magic)
 	msg[2] = MsgTypeReadIndex
 	binary.BigEndian.PutUint64(msg[3:11], toID)
 	binary.BigEndian.PutUint64(msg[11:19], fromID)
 	binary.BigEndian.PutUint64(msg[19:27], marker)
-	binary.BigEndian.PutUint64(msg[27:35], 0)
 	return msg
 }
 

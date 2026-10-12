@@ -19,7 +19,7 @@ import (
 	"testing"
 )
 
-// TestEncodeReadGateMsgLayout pins all 35 bytes. This package is one of only
+// TestEncodeReadGateMsgLayout pins all 43 bytes. This package is one of only
 // two independent encodings of the read-gate layout — the other is
 // tack/tack-switch-agen.p4 — so a silent drift here desynchronizes the switch.
 func TestEncodeReadGateMsgLayout(t *testing.T) {
@@ -47,6 +47,9 @@ func TestEncodeReadGateMsgLayout(t *testing.T) {
 	if got := binary.BigEndian.Uint64(msg[19:27]); got != marker {
 		t.Errorf("marker = %#x, want %#x", got, marker)
 	}
+	if len(msg) != MsgLen || MsgLen != 43 {
+		t.Errorf("length = %d, want 43", len(msg))
+	}
 }
 
 // TestEncodeReadGateMsgValueIsZero is the point of the 2026-08-20 sentinel
@@ -60,6 +63,10 @@ func TestEncodeReadGateMsgValueIsZero(t *testing.T) {
 	msg := EncodeReadGateMsg(0xFEED, 1, 2, 3)
 	if got := binary.BigEndian.Uint64(msg[27:35]); got != 0 {
 		t.Fatalf("value = %#x, want 0", got)
+	}
+	// The boot ID and term are the switch's to fill; a client never claims one.
+	if got := binary.BigEndian.Uint64(msg[35:43]); got != 0 {
+		t.Fatalf("boot ID and term = %#x, want 0", got)
 	}
 }
 

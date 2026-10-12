@@ -1429,7 +1429,7 @@ func (n *nodeRecorder) ReadIndex(ctx context.Context, rctx []byte) error        
 // package drives the follower-lease path, and a recorder that never asks for a
 // lease is the behaviour the existing assertions were written against.
 // Promoted to *readyNode and *nodeConfChangeCommitterRecorder via embedding.
-func (n *nodeRecorder) ReadIndexSwitchHint(ctx context.Context, rctx []byte, switchIndex uint64) error {
+func (n *nodeRecorder) ReadIndexSwitchHint(ctx context.Context, rctx []byte, switchIndex uint64, switchTerm uint64) error {
 	return nil
 }
 func (n *nodeRecorder) IsAskingForReadLease() bool { return false }

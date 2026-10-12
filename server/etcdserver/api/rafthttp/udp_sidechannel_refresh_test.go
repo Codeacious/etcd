@@ -16,7 +16,6 @@ package rafthttp
 
 import (
 	"context"
-	"encoding/binary"
 	"math"
 	"net"
 	"sync/atomic"
@@ -58,11 +57,23 @@ func newRefreshTestSidechannel(t *testing.T) *UdpSidechannel {
 	}
 }
 
-func addRefreshTestPeer(sc *UdpSidechannel, id uint64, lastSentIndex uint64) *udpPeerInfo {
+// testBootID and testTerm are what the test switch reports: the boot ID the
+// test peers' paths already know, and the term of the last accepted write.
+const (
+	testBootID = uint32(0xB0071D)
+	testTerm   = uint32(4)
+)
+
+// addRefreshTestPeer adds a peer behind the test switch (magic sc.magic),
+// whose boot ID this node already knows, so replies carrying testBootID are
+// credited.
+func addRefreshTestPeer(sc *UdpSidechannel, id uint64) *udpPeerInfo {
+	sw := sc.switchFor(sc.magic)
+	atomic.StoreUint32(&sw.bootID, testBootID)
 	peer := &udpPeerInfo{
-		id:            types.ID(id),
-		magic:         sc.magic,
-		lastSentIndex: lastSentIndex,
+		id:    types.ID(id),
+		magic: sc.magic,
+		sw:    sw,
 		// A routing target for QuerySwitchIndex; nothing listens on it.
 		remote: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1},
 	}
@@ -70,19 +81,21 @@ func addRefreshTestPeer(sc *UdpSidechannel, id uint64, lastSentIndex uint64) *ud
 	return peer
 }
 
+// encodeAskAckIndexResp is the switch's reply to a write or ask this node
+// sent on peer from's path.
 func encodeAskAckIndexResp(sc *UdpSidechannel, from uint64, value uint64) []byte {
-	return encodeAskAckIndexRespWithMarker(sc, from, 0, value)
+	m := sidechannelMsg{magic: sc.magic, msgType: byte(raftpb.MsgAskAckIndexResp),
+		to: uint64(sc.id), from: from, value: value, bootID: testBootID, term: testTerm}.encode()
+	return m[:]
 }
 
-func encodeAskAckIndexRespWithMarker(sc *UdpSidechannel, from, marker, value uint64) []byte {
-	buf := make([]byte, 35)
-	binary.BigEndian.PutUint16(buf[0:2], sc.magic)
-	buf[2] = byte(raftpb.MsgAskAckIndexResp)
-	binary.BigEndian.PutUint64(buf[3:11], uint64(sc.id))
-	binary.BigEndian.PutUint64(buf[11:19], from)
-	binary.BigEndian.PutUint64(buf[19:27], marker)
-	binary.BigEndian.PutUint64(buf[27:35], value)
-	return buf
+// encodeQueryReply is the switch's reply to this node's own QuerySwitchIndex
+// for batch marker: to == from == self.
+func encodeQueryReply(sc *UdpSidechannel, marker, value uint64) []byte {
+	m := sidechannelMsg{magic: sc.magic, msgType: byte(raftpb.MsgAskAckIndexResp),
+		to: uint64(sc.id), from: uint64(sc.id), marker: marker, value: value,
+		bootID: testBootID, term: testTerm}.encode()
+	return m[:]
 }
 
 func drain(sc *UdpSidechannel) []udpSidechannelMsg {
@@ -104,7 +117,7 @@ func drain(sc *UdpSidechannel) []udpSidechannelMsg {
 // while every gated read forwarded.
 func TestSwitchUpdatedFlagOnlySetByNonzero(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	peer := addRefreshTestPeer(sc, 2, 500)
+	peer := addRefreshTestPeer(sc, 2)
 
 	sc.handleUdpSidechannelMsg(encodeAskAckIndexResp(sc, 2, 0), peer)
 	if got := atomic.LoadUint32(&peer.switchUpdated); got != 0 {
@@ -121,7 +134,8 @@ func TestSwitchUpdatedFlagOnlySetByNonzero(t *testing.T) {
 // switch answering 0 must be retried on every tick, not every other one.
 func TestRefreshIdleSwitchesRepeatsWhileRegisterEmpty(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	peer := addRefreshTestPeer(sc, 2, 500)
+	peer := addRefreshTestPeer(sc, 2)
+	sc.highWater, sc.leaderTerm = 500, uint64(testTerm)
 	holders := []uint64{2}
 
 	for tick := 0; tick < 3; tick++ {
@@ -130,11 +144,13 @@ func TestRefreshIdleSwitchesRepeatsWhileRegisterEmpty(t *testing.T) {
 		if len(msgs) != 1 {
 			t.Fatalf("tick %d: got %d refreshes, want 1", tick, len(msgs))
 		}
-		if got := binary.BigEndian.Uint64(msgs[0].msg[27:35]); got != 500 {
-			t.Fatalf("tick %d: refreshed with index %d, want lastSentIndex 500", tick, got)
+		w := decodeSidechannelMsg(msgs[0].msg[:])
+		if w.value != 500 || w.bootID != testBootID || w.term != testTerm {
+			t.Fatalf("tick %d: refreshed with (%d, boot %#x, term %d), want the high-water mark 500 under (%#x, %d)",
+				tick, w.value, w.bootID, w.term, testBootID, testTerm)
 		}
-		if got := msgs[0].msg[2]; got != byte(raftpb.MsgApp) {
-			t.Fatalf("tick %d: refresh type %d, want MsgApp", tick, got)
+		if w.msgType != byte(raftpb.MsgApp) {
+			t.Fatalf("tick %d: refresh type %d, want MsgApp", tick, w.msgType)
 		}
 		// The switch is still empty, so its answer is 0 and the flag stays clear.
 		sc.handleUdpSidechannelMsg(encodeAskAckIndexResp(sc, 2, 0), peer)
@@ -151,8 +167,9 @@ func TestRefreshIdleSwitchesRepeatsWhileRegisterEmpty(t *testing.T) {
 
 func TestRefreshIdleSwitchesSkipsPeersWithoutLease(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	addRefreshTestPeer(sc, 2, 500)
-	addRefreshTestPeer(sc, 3, 700)
+	addRefreshTestPeer(sc, 2)
+	addRefreshTestPeer(sc, 3)
+	sc.highWater = 700
 
 	// Only peer 2 holds a lease; peer 3 cannot serve locally, so its switch
 	// state is moot until it is granted one.
@@ -173,11 +190,11 @@ func TestRefreshIdleSwitchesSkipsPeersWithoutLease(t *testing.T) {
 
 func TestRefreshIdleSwitchesSkipsUntappedPeer(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	addRefreshTestPeer(sc, 2, 0) // never tapped anything
+	addRefreshTestPeer(sc, 2) // this node never tapped anything: high-water mark 0
 
 	sc.RefreshIdleSwitches([]uint64{2})
 	if msgs := drain(sc); len(msgs) != 0 {
-		t.Fatalf("refreshed a peer with no proposed index to restore: %d msgs", len(msgs))
+		t.Fatalf("refreshed with no high-water mark to restore: %d msgs", len(msgs))
 	}
 }
 
@@ -185,7 +202,8 @@ func TestRefreshIdleSwitchesSkipsUntappedPeer(t *testing.T) {
 // got a lease must not wait a tick for its path to be re-armed.
 func TestGrantedLeaseRefreshesSwitch(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	addRefreshTestPeer(sc, 2, 500)
+	addRefreshTestPeer(sc, 2)
+	sc.highWater = 500
 
 	granted := raftpb.Message{Type: raftpb.MsgAskReadLeaseResp, To: 2, From: 1}
 	sc.ProcessOutgoingMessage(&granted)
@@ -193,8 +211,8 @@ func TestGrantedLeaseRefreshesSwitch(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Fatalf("granting a lease sent %d refreshes, want 1", len(msgs))
 	}
-	if got := binary.BigEndian.Uint64(msgs[0].msg[27:35]); got != 500 {
-		t.Fatalf("refreshed with index %d, want lastSentIndex 500", got)
+	if got := decodeSidechannelMsg(msgs[0].msg[:]).value; got != 500 {
+		t.Fatalf("refreshed with index %d, want the high-water mark 500", got)
 	}
 
 	rejected := raftpb.Message{Type: raftpb.MsgAskReadLeaseResp, To: 2, From: 1, Reject: true}
@@ -204,42 +222,41 @@ func TestGrantedLeaseRefreshesSwitch(t *testing.T) {
 	}
 }
 
-// TestGrantHookLeavesTapCASAlone guards the interaction that would break the
-// MsgApp tap: the refresh must not advance lastSentIndex, or the next real tap
-// at that index would be deduped away.
-func TestGrantHookLeavesTapCASAlone(t *testing.T) {
+// TestGrantHookLeavesTapDedupeAlone guards the interaction that would break the
+// MsgApp tap: the refresh must not advance the path's (term, high-water mark),
+// or the next real tap would be deduped away.
+func TestGrantHookLeavesTapDedupeAlone(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	peer := addRefreshTestPeer(sc, 2, 500)
+	peer := addRefreshTestPeer(sc, 2)
+	sc.highWater, sc.leaderTerm = 500, 2
+	peer.lastSentTerm, peer.lastSentHighWater = 2, 400
 
 	granted := raftpb.Message{Type: raftpb.MsgAskReadLeaseResp, To: 2, From: 1}
 	sc.ProcessOutgoingMessage(&granted)
 	drain(sc)
 
-	if got := atomic.LoadUint64(&peer.lastSentIndex); got != 500 {
-		t.Fatalf("refresh moved lastSentIndex to %d, want it untouched at 500", got)
+	if peer.lastSentTerm != 2 || peer.lastSentHighWater != 400 {
+		t.Fatalf("refresh moved the dedupe state to (%d, %d), want it untouched at (2, 400)",
+			peer.lastSentTerm, peer.lastSentHighWater)
 	}
 
 	// A real tap at a higher index must still go out.
-	app := raftpb.Message{Type: raftpb.MsgApp, To: 2, Index: 500, Entries: []raftpb.Entry{{Index: 501}}}
+	app := raftpb.Message{Type: raftpb.MsgApp, To: 2, Term: 2, Index: 500, Entries: []raftpb.Entry{{Index: 501}}}
 	sc.ProcessOutgoingMessage(&app)
 	msgs := drain(sc)
 	if len(msgs) != 1 {
 		t.Fatalf("tap after refresh sent %d msgs, want 1", len(msgs))
 	}
-	if got := binary.BigEndian.Uint64(msgs[0].msg[27:35]); got != 501 {
+	if got := decodeSidechannelMsg(msgs[0].msg[:]).value; got != 501 {
 		t.Fatalf("tap carried index %d, want 501", got)
 	}
 }
 
 func encodeReadIndexReflection(sc *UdpSidechannel, marker, value uint64) []byte {
-	buf := make([]byte, 35)
-	binary.BigEndian.PutUint16(buf[0:2], sc.magic)
-	buf[2] = byte(raftpb.MsgReadIndex)
-	binary.BigEndian.PutUint64(buf[3:11], uint64(sc.id))
-	binary.BigEndian.PutUint64(buf[11:19], uint64(sc.id))
-	binary.BigEndian.PutUint64(buf[19:27], marker)
-	binary.BigEndian.PutUint64(buf[27:35], value)
-	return buf
+	m := sidechannelMsg{magic: sc.magic, msgType: byte(raftpb.MsgReadIndex),
+		to: uint64(sc.id), from: uint64(sc.id), marker: marker, value: value,
+		bootID: testBootID, term: testTerm}.encode()
+	return m[:]
 }
 
 // TestUnstampedReadIndexIsDiscarded inverts the 2026-08-20 behaviour. That
@@ -271,7 +288,7 @@ func TestUnstampedReadIndexIsDiscarded(t *testing.T) {
 // state than one already observed.
 func TestUnstampedReadIndexLeavesCacheAlone(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	sc.updateSwitchIndex(0, 500)
+	sc.updateSwitchIndex(0, switchStamp{index: 500, term: testTerm})
 
 	sc.handleUdpSidechannelMsg(encodeReadIndexReflection(sc, 1, 0), nil)
 
@@ -287,10 +304,10 @@ func TestUnstampedReadIndexLeavesCacheAlone(t *testing.T) {
 // picked up by the next usable answer.
 func TestZeroAskAckIndexRespKeepsBatchQueued(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	addRefreshTestPeer(sc, 2, 100)
-	sc.updateSwitchIndex(0, 500) // warm cache, as after a switch reboot
+	addRefreshTestPeer(sc, 2)
+	sc.updateSwitchIndex(0, switchStamp{index: 500, term: testTerm}) // warm cache, as after a switch reboot
 
-	ch := make(chan uint64, 1)
+	ch := make(chan switchStamp, 1)
 	const readMarker = uint64(0xBEEF01)
 	sc.readGate.pending.Store(readMarker, ch)
 	sc.readGate.pendingBatches = append(sc.readGate.pendingBatches, pendingMarkerBatch{
@@ -300,7 +317,7 @@ func TestZeroAskAckIndexRespKeepsBatchQueued(t *testing.T) {
 
 	// Marker 7 is a REAL batch marker, so releasePendingBatches' own
 	// batchMarker == 0 guard does not fire. Only a guard on the value stops it.
-	sc.handleUdpSidechannelMsg(encodeAskAckIndexRespWithMarker(sc, 2, 7, 0), nil)
+	sc.handleUdpSidechannelMsg(encodeQueryReply(sc, 7, 0), nil)
 	if len(ch) != 0 {
 		t.Fatal("a zero-valued MsgAskAckIndexResp released a gated read at the stale cache")
 	}
@@ -309,11 +326,11 @@ func TestZeroAskAckIndexRespKeepsBatchQueued(t *testing.T) {
 	}
 
 	// A usable answer arrives: now the batch releases.
-	sc.handleUdpSidechannelMsg(encodeAskAckIndexRespWithMarker(sc, 2, 7, 900), nil)
+	sc.handleUdpSidechannelMsg(encodeQueryReply(sc, 7, 900), nil)
 	select {
 	case got := <-ch:
-		if got != 900 {
-			t.Fatalf("released at %d, want the refreshed 900", got)
+		if got.index != 900 || got.term != testTerm {
+			t.Fatalf("released at %+v, want the refreshed 900 at term %d", got, testTerm)
 		}
 	default:
 		t.Fatal("a usable answer did not release the queued batch")
@@ -325,7 +342,7 @@ func TestZeroAskAckIndexRespKeepsBatchQueued(t *testing.T) {
 // resolved leaks an entry nothing ever consumes.
 func TestAskAckIndexRespLeavesNoZeroMarker(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	addRefreshTestPeer(sc, 2, 100)
+	addRefreshTestPeer(sc, 2)
 
 	sc.handleUdpSidechannelMsg(encodeAskAckIndexResp(sc, 2, 900), nil)
 
@@ -341,12 +358,12 @@ func TestAskAckIndexRespLeavesNoZeroMarker(t *testing.T) {
 // the follower for entries it never needed to see.
 func TestBatchReleasedAtAnsweredIndex(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	addRefreshTestPeer(sc, 2, 100)
+	addRefreshTestPeer(sc, 2)
 
 	// Some other read has already pushed the global maximum well ahead.
-	sc.updateSwitchIndex(0, 5000)
+	sc.updateSwitchIndex(0, switchStamp{index: 5000, term: testTerm})
 
-	ch := make(chan uint64, 1)
+	ch := make(chan switchStamp, 1)
 	const readMarker = uint64(0xBEEF02)
 	sc.readGate.pending.Store(readMarker, ch)
 	sc.readGate.pendingBatches = append(sc.readGate.pendingBatches, pendingMarkerBatch{
@@ -354,11 +371,11 @@ func TestBatchReleasedAtAnsweredIndex(t *testing.T) {
 		markers:     []uint64{readMarker},
 	})
 
-	sc.handleUdpSidechannelMsg(encodeAskAckIndexRespWithMarker(sc, 2, 7, 1200), nil)
+	sc.handleUdpSidechannelMsg(encodeQueryReply(sc, 7, 1200), nil)
 
 	select {
 	case got := <-ch:
-		if got != 1200 {
+		if got.index != 1200 {
 			t.Fatalf("released at %d, want this query's own answer 1200", got)
 		}
 	default:
@@ -374,13 +391,16 @@ func TestBatchReleasedAtAnsweredIndex(t *testing.T) {
 // the gate deadline and forwarding.
 func TestDroppedReflectionRecoveredByQuery(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	addRefreshTestPeer(sc, 2, 100)
+	addRefreshTestPeer(sc, 2)
 	go sc.querySwitchIndexLoop()
 
 	const clientMarker = uint64(0xABCD00000042) // upper 32 bits set: client-minted
 	done := make(chan uint64, 1)
 	go func() {
-		got, err := sc.WaitForReadGate(context.Background(), clientMarker)
+		got, term, err := sc.WaitForReadGate(context.Background(), clientMarker)
+		if err == nil && term != uint64(testTerm) {
+			t.Errorf("released at term %d, want the stamped %d", term, testTerm)
+		}
 		if err != nil {
 			t.Errorf("gate errored: %v", err)
 		}
@@ -399,7 +419,7 @@ func TestDroppedReflectionRecoveredByQuery(t *testing.T) {
 		}
 		sc.readGate.pendingBatchesLock.Unlock()
 		if newest != 0 {
-			sc.handleUdpSidechannelMsg(encodeAskAckIndexRespWithMarker(sc, 2, newest, 1200), nil)
+			sc.handleUdpSidechannelMsg(encodeQueryReply(sc, newest, 1200), nil)
 			break
 		}
 		time.Sleep(time.Millisecond)
@@ -420,10 +440,10 @@ func TestDroppedReflectionRecoveredByQuery(t *testing.T) {
 // to the leader. Only the caller's own deadline is an error.
 func TestWaitForReadGateForwardsOnDeadline(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	addRefreshTestPeer(sc, 2, 100)
+	addRefreshTestPeer(sc, 2)
 
 	start := time.Now()
-	got, err := sc.WaitForReadGate(context.Background(), 0)
+	got, _, err := sc.WaitForReadGate(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("an expired gate must not error, got %v", err)
 	}
@@ -442,11 +462,11 @@ func TestWaitForReadGateForwardsOnDeadline(t *testing.T) {
 // outcome that fails the read rather than forwarding it.
 func TestWaitForReadGateCallerDeadlineErrors(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	addRefreshTestPeer(sc, 2, 100)
+	addRefreshTestPeer(sc, 2)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
-	if _, err := sc.WaitForReadGate(ctx, 0); err == nil {
+	if _, _, err := sc.WaitForReadGate(ctx, 0); err == nil {
 		t.Fatal("expected the caller's deadline to fail the read")
 	}
 }
@@ -458,12 +478,12 @@ func TestWaitForReadGateCallerDeadlineErrors(t *testing.T) {
 // ask queues a batch, so counting batches counts asks.
 func TestQuerySwitchIndexLoopReasksWhileWaiting(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	addRefreshTestPeer(sc, 2, 100)
+	addRefreshTestPeer(sc, 2)
 	go sc.querySwitchIndexLoop()
 
 	// A marker that nothing will ever answer.
 	const marker = uint64(0xFEED01)
-	sc.readGate.pending.Store(marker, make(chan uint64, 1))
+	sc.readGate.pending.Store(marker, make(chan switchStamp, 1))
 	sc.readGate.pendingMarkers <- readGateAsk{marker: marker, nextAskAt: time.Now()}
 
 	deadline := time.Now().Add(500 * time.Millisecond)
@@ -485,7 +505,7 @@ func TestQuerySwitchIndexLoopReasksWhileWaiting(t *testing.T) {
 // deadline that clears their markers.
 func TestQuerySwitchIndexLoopDropsDeadBatches(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	addRefreshTestPeer(sc, 2, 100)
+	addRefreshTestPeer(sc, 2)
 
 	// Two batches whose markers are long gone, plus one live marker. Push
 	// markerSeq past them so the loop's own batch markers cannot collide.
@@ -495,7 +515,7 @@ func TestQuerySwitchIndexLoopDropsDeadBatches(t *testing.T) {
 	}
 	sc.readGate.markerSeq = 1000
 	const live = uint64(0xFEED02)
-	sc.readGate.pending.Store(live, make(chan uint64, 1))
+	sc.readGate.pending.Store(live, make(chan switchStamp, 1))
 
 	go sc.querySwitchIndexLoop()
 	sc.readGate.pendingMarkers <- readGateAsk{marker: live, nextAskAt: time.Now()}
@@ -539,21 +559,21 @@ func TestGateInactiveDropsReflection(t *testing.T) {
 // ever came for.
 func TestResolvedRotationBoundsUnclaimed(t *testing.T) {
 	r := newResolvedMarkers()
-	r.store(1, 100)
+	r.store(1, switchStamp{index: 100, term: 1})
 	if n := r.len(); n != 1 {
 		t.Fatalf("len = %d, want 1", n)
 	}
 
 	// Force a rotation: the entry moves to prev but is still claimable.
 	r.lastRotate = time.Now().Add(-2 * resolvedMarkerTTL)
-	r.store(2, 200)
+	r.store(2, switchStamp{index: 200, term: 1})
 	if _, ok := r.load(1); !ok {
 		t.Fatal("an entry was dropped after only one rotation")
 	}
 
 	// A second rotation drops the generation holding it.
 	r.lastRotate = time.Now().Add(-2 * resolvedMarkerTTL)
-	r.store(3, 300)
+	r.store(3, switchStamp{index: 300, term: 1})
 	if _, ok := r.load(1); ok {
 		t.Fatal("an unclaimed entry survived two rotations")
 	}
@@ -566,14 +586,14 @@ func TestResolvedRotationBoundsUnclaimed(t *testing.T) {
 // whichever generation holds it, and claiming must remove it.
 func TestResolvedTakeSpansGenerations(t *testing.T) {
 	r := newResolvedMarkers()
-	r.store(1, 100)
+	r.store(1, switchStamp{index: 100, term: 1})
 	r.lastRotate = time.Now().Add(-2 * resolvedMarkerTTL)
-	r.store(2, 200) // rotates; 1 is now in prev, 2 in curr
+	r.store(2, switchStamp{index: 200, term: 1}) // rotates; 1 is now in prev, 2 in curr
 
 	for _, tc := range []struct{ marker, want uint64 }{{1, 100}, {2, 200}} {
 		got, ok := r.take(tc.marker)
-		if !ok || got != tc.want {
-			t.Fatalf("take(%d) = %d, %v; want %d, true", tc.marker, got, ok, tc.want)
+		if !ok || got.index != tc.want {
+			t.Fatalf("take(%d) = %d, %v; want %d, true", tc.marker, got.index, ok, tc.want)
 		}
 		if _, ok := r.load(tc.marker); ok {
 			t.Fatalf("take(%d) left the entry behind", tc.marker)
@@ -590,11 +610,11 @@ func TestResolvedTakeSpansGenerations(t *testing.T) {
 // to get. Eligibility is per-marker; the timer only decides when to look.
 func TestQueryLoopWaitsForMarkerMaturity(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
-	addRefreshTestPeer(sc, 2, 100)
+	addRefreshTestPeer(sc, 2)
 	go sc.querySwitchIndexLoop()
 
 	const marker = uint64(0xFEED03)
-	sc.readGate.pending.Store(marker, make(chan uint64, 1))
+	sc.readGate.pending.Store(marker, make(chan switchStamp, 1))
 	// Deliberately far in the future: no query may name this marker yet.
 	sc.readGate.pendingMarkers <- readGateAsk{
 		marker:    marker,

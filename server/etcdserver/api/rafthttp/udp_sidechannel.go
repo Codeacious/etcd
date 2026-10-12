@@ -42,7 +42,75 @@ const (
 	// so an entry actually lives between one and two of these.
 	// Keep this long- it's only to stop memory leaking by clearing the resolved marker map.
 	resolvedMarkerTTL = time.Second
+
+	// udpSidechannelMsgLen is the fixed sidechannel payload length:
+	// magic(2) type(1) to(8) from(8) marker(8) value(8) bootID(4) term(4).
+	udpSidechannelMsgLen = 43
+
+	// msgSwitchNack is the sidechannel-only type a switch reflects instead of
+	// applying a write whose boot ID is not its own (SAFE-1). It sits outside
+	// the raftpb range so it can never be mistaken for a raft message.
+	msgSwitchNack = 0x80
 )
+
+// switchStamp is what a switch reported for a read: its register, and the
+// highest term among the writes it has accepted since it booted. Raft uses the
+// index only in that term (SAFE-1). A zero index or term carries no information.
+type switchStamp struct {
+	index uint64
+	term  uint32
+}
+
+// sidechannelMsg is one sidechannel datagram, decoded or about to be encoded.
+type sidechannelMsg struct {
+	magic   uint16
+	msgType byte
+	to      uint64
+	from    uint64
+	marker  uint64
+	value   uint64
+	bootID  uint32
+	term    uint32
+}
+
+func (m sidechannelMsg) encode() (buf [udpSidechannelMsgLen]byte) {
+	binary.BigEndian.PutUint16(buf[0:2], m.magic)
+	buf[2] = m.msgType
+	binary.BigEndian.PutUint64(buf[3:11], m.to)
+	binary.BigEndian.PutUint64(buf[11:19], m.from)
+	binary.BigEndian.PutUint64(buf[19:27], m.marker)
+	binary.BigEndian.PutUint64(buf[27:35], m.value)
+	binary.BigEndian.PutUint32(buf[35:39], m.bootID)
+	binary.BigEndian.PutUint32(buf[39:43], m.term)
+	return buf
+}
+
+// decodeSidechannelMsg decodes a datagram of at least udpSidechannelMsgLen bytes.
+func decodeSidechannelMsg(buf []byte) sidechannelMsg {
+	return sidechannelMsg{
+		magic:   binary.BigEndian.Uint16(buf[0:2]),
+		msgType: buf[2],
+		to:      binary.BigEndian.Uint64(buf[3:11]),
+		from:    binary.BigEndian.Uint64(buf[11:19]),
+		marker:  binary.BigEndian.Uint64(buf[19:27]),
+		value:   binary.BigEndian.Uint64(buf[27:35]),
+		bootID:  binary.BigEndian.Uint32(buf[35:39]),
+		term:    binary.BigEndian.Uint32(buf[39:43]),
+	}
+}
+
+// atomicMax raises *addr to at least v and returns the resulting value.
+func atomicMax(addr *uint64, v uint64) uint64 {
+	for {
+		cur := atomic.LoadUint64(addr)
+		if v <= cur {
+			return cur
+		}
+		if atomic.CompareAndSwapUint64(addr, cur, v) {
+			return v
+		}
+	}
+}
 
 // readGateAsk is a marker for a read waiting on the switch, with the time it becomes
 // eligible to be included in a switch query. Per-read rather than batched because the
@@ -56,32 +124,32 @@ type readGateAsk struct {
 // We maintain a 'current' and 'previous' map that gets shifted back every resolvedMarkerTTL.
 type resolvedMarkers struct {
 	mu         sync.RWMutex
-	curr       map[uint64]uint64 // on resolvedMarkerTTL -> move curr to prev
-	prev       map[uint64]uint64 // on resolvedMarkerTTL -> drop prev (before moving curr)
+	curr       map[uint64]switchStamp // on resolvedMarkerTTL -> move curr to prev
+	prev       map[uint64]switchStamp // on resolvedMarkerTTL -> drop prev (before moving curr)
 	lastRotate time.Time
 }
 
 func newResolvedMarkers() *resolvedMarkers {
 	return &resolvedMarkers{
-		curr:       make(map[uint64]uint64),
-		prev:       make(map[uint64]uint64),
+		curr:       make(map[uint64]switchStamp),
+		prev:       make(map[uint64]switchStamp),
 		lastRotate: time.Now(),
 	}
 }
 
-func (r *resolvedMarkers) store(marker, switchIndex uint64) {
+func (r *resolvedMarkers) store(marker uint64, stamp switchStamp) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if now := time.Now(); now.Sub(r.lastRotate) >= resolvedMarkerTTL {
 		r.prev = r.curr
-		r.curr = make(map[uint64]uint64)
+		r.curr = make(map[uint64]switchStamp)
 		r.lastRotate = now
 	}
-	r.curr[marker] = switchIndex
+	r.curr[marker] = stamp
 }
 
 // take returns and removes a marker's answer from either generation.
-func (r *resolvedMarkers) take(marker uint64) (uint64, bool) {
+func (r *resolvedMarkers) take(marker uint64) (switchStamp, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if v, ok := r.curr[marker]; ok {
@@ -92,7 +160,7 @@ func (r *resolvedMarkers) take(marker uint64) (uint64, bool) {
 		delete(r.prev, marker)
 		return v, true
 	}
-	return 0, false
+	return switchStamp{}, false
 }
 
 func (r *resolvedMarkers) remove(marker uint64) {
@@ -102,7 +170,7 @@ func (r *resolvedMarkers) remove(marker uint64) {
 	delete(r.prev, marker)
 }
 
-func (r *resolvedMarkers) load(marker uint64) (uint64, bool) {
+func (r *resolvedMarkers) load(marker uint64) (switchStamp, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if v, ok := r.curr[marker]; ok {
@@ -136,22 +204,80 @@ type UdpSidechannel struct {
 	// Allows setting a predicate on whether the gate should be used.
 	// Used to allow leaders to bypass the gate. nil means the gate is always used.
 	gateActive func() bool
+
+	// highWater is the largest index this node has proposed to any switch:
+	// the end of every MsgApp it has copied, and nothing else. Every write
+	// carries it, and every credit is capped at it, so whichever write reaches
+	// a freshly booted switch first covers every credit this node has given
+	// (SAFE-1).
+	highWater uint64 // atomic
+	// leaderTerm is the highest term of any MsgApp this node has copied to a
+	// switch, i.e. a term in which it was leader. Refreshes and re-seeds,
+	// which no raft message carries a term for, write with it.
+	leaderTerm uint64 // atomic
+
+	// switches maps a switch's magic (unique per switch by configuration) to
+	// what this node knows about it. Every path crossing a switch shares it.
+	switches sync.Map // uint16 -> *switchState
+}
+
+// switchState is what this node knows about one switch.
+type switchState struct {
+	// bootID is the switch's boot ID, learned from its NACKs; 0 until then.
+	// Writes on every path crossing the switch carry it, and only replies
+	// carrying it are credited. It is per switch, not per path: a path that
+	// has not yet seen a reboot must not keep crediting the dead boot's replies.
+	bootID uint32 // atomic
+}
+
+// switchFor returns the shared state of the switch with the given magic.
+func (sc *UdpSidechannel) switchFor(magic uint16) *switchState {
+	v, _ := sc.switches.LoadOrStore(magic, &switchState{})
+	return v.(*switchState)
 }
 
 type udpPeerInfo struct {
-	id            types.ID
-	remote        *net.UDPAddr
-	magic         uint16
-	conn          *net.UDPConn
-	refcount      int
-	lastSentIndex uint64 // atomic: highest MsgApp proposed index emitted to the switch
+	id       types.ID
+	remote   *net.UDPAddr
+	magic    uint16
+	conn     *net.UDPConn
+	refcount int
 	// Atomic bool tracking if we know the switch's saved proposed index on this path
 	// has been updated within the last RefreshIdleSwitches interval
 	switchUpdated uint32
+	// sw is the switch this path crosses, shared with every other path
+	// advertising the same magic.
+	sw *switchState
+
+	// sentMu guards the (term, high-water mark) last written on this path,
+	// which dedupes MsgApp copies. Keyed on the term too: a re-elected leader
+	// must write in its new term even if its high-water mark has not moved.
+	sentMu            sync.Mutex
+	lastSentTerm      uint64
+	lastSentHighWater uint64
+}
+
+// recordLastSent records a MsgApp copy of (term, highWater) on this path and
+// reports whether it is newer than the last one written.
+func (p *udpPeerInfo) recordLastSent(term, highWater uint64) bool {
+	p.sentMu.Lock()
+	defer p.sentMu.Unlock()
+	if term < p.lastSentTerm || (term == p.lastSentTerm && highWater <= p.lastSentHighWater) {
+		return false
+	}
+	p.lastSentTerm, p.lastSentHighWater = term, highWater
+	return true
+}
+
+// resetLastSent forgets the last write on this path, so the next MsgApp copy goes out.
+func (p *udpPeerInfo) resetLastSent() {
+	p.sentMu.Lock()
+	defer p.sentMu.Unlock()
+	p.lastSentTerm, p.lastSentHighWater = 0, 0
 }
 
 type udpSidechannelMsg struct {
-	msg    [35]byte
+	msg    [udpSidechannelMsgLen]byte
 	conn   *net.UDPConn
 	remote *net.UDPAddr
 	peerID types.ID
@@ -250,7 +376,7 @@ func (sc *UdpSidechannel) readLoop() {
 			continue
 		}
 
-		if n < 35 {
+		if n < udpSidechannelMsgLen {
 			sc.lg.Warn("received UDP sidechannel message with invalid length",
 				zap.Int("length", n))
 			continue
@@ -265,19 +391,15 @@ func (sc *UdpSidechannel) readLoop() {
 // handleUdpSidechannelMsg decodes one sidechannel datagram. src is the peer
 // whose connected socket delivered it, or nil for the shared listener.
 func (sc *UdpSidechannel) handleUdpSidechannelMsg(buf []byte, src *udpPeerInfo) {
-	magic := binary.BigEndian.Uint16(buf[0:2])
-	msgType := raftpb.MessageType(buf[2])
-	to := binary.BigEndian.Uint64(buf[3:11])
-	from := binary.BigEndian.Uint64(buf[11:19])
-	marker := binary.BigEndian.Uint64(buf[19:27])
-	value := binary.BigEndian.Uint64(buf[27:35])
+	m := decodeSidechannelMsg(buf)
+	msgType := raftpb.MessageType(m.msgType)
 
 	// MsgReadIndex is sent by the proxy (not a cluster peer) and tagged by the switch.
 	// Handle it before the peer lookup since the proxy's ID is not in sc.peers.
 	if msgType == raftpb.MsgReadIndex {
-		if magic != sc.magic {
+		if m.magic != sc.magic {
 			sc.lg.Warn("received MsgReadIndex with invalid magic",
-				zap.Uint16("magic", magic))
+				zap.Uint16("magic", m.magic))
 			return
 		}
 		// Skip the gate if our getActive() predicate is true.
@@ -288,20 +410,44 @@ func (sc *UdpSidechannel) handleUdpSidechannelMsg(buf []byte, src *udpPeerInfo) 
 		if sc.gateActive != nil && !sc.gateActive() {
 			return
 		}
-		sc.updateSwitchIndex(marker, value)
+		sc.updateSwitchIndex(m.marker, switchStamp{index: m.value, term: m.term})
 		return
 	}
 
-	_, ok := sc.peers.Load(types.ID(from))
-	if !ok && types.ID(from) != sc.id {
-		sc.lg.Warn("received UDP sidechannel message with unknown peer ID",
-			zap.Uint64("peerID", from))
+	// A reply to this node's own QuerySwitchIndex: to == from == self.
+	if types.ID(m.from) == sc.id {
+		if m.magic != sc.magic {
+			sc.lg.Warn("received UDP sidechannel query reply with invalid magic",
+				zap.Uint16("magic", m.magic))
+			return
+		}
+		if msgType == raftpb.MsgAskAckIndexResp {
+			// The marker could be for a batch of requests.
+			stamp := switchStamp{index: m.value, term: m.term}
+			sc.updateSwitchIndex(0, stamp)
+			// Passing 0 here is fine; releasePendingBatches doesn't do anything if either arg is 0.
+			sc.releasePendingBatches(m.marker, stamp)
+		}
 		return
 	}
 
-	if magic != sc.magic {
+	// Everything else answers a write or ask this node sent on a peer's path.
+	// The connected per-peer socket names the path; without one (dial failure)
+	// the reply arrives on the listener and the peer is found by id.
+	peer := src
+	if peer == nil {
+		v, ok := sc.peers.Load(types.ID(m.from))
+		if !ok {
+			sc.lg.Warn("received UDP sidechannel message with unknown peer ID",
+				zap.Uint64("peerID", m.from))
+			return
+		}
+		peer = v.(*udpPeerInfo)
+	}
+	// The switch on this path answers in the peer's magic, not necessarily ours.
+	if m.magic != peer.magic {
 		sc.lg.Warn("received UDP sidechannel message with invalid magic",
-			zap.Uint16("magic", magic))
+			zap.Uint16("magic", m.magic), zap.Uint16("want", peer.magic))
 		return
 	}
 
@@ -309,35 +455,102 @@ func (sc *UdpSidechannel) handleUdpSidechannelMsg(buf []byte, src *udpPeerInfo) 
 	case raftpb.MsgApp:
 		// We don't care about this one; these are purely for the switch.
 		sc.lg.Info("Got a MsgApp via UDP sidechannel")
-		return
 	case raftpb.MsgAskAckIndex:
 		// Same as for MsgApp; this is for the switch.
 		sc.lg.Info("Got a MsgAskAckIndex via UDP sidechannel")
-		return
+	case msgSwitchNack:
+		sc.handleSwitchNack(peer, m)
 	case raftpb.MsgAskAckIndexResp:
-		// This is a switch response query; the marker could be for a batch of requests.
-		// Mark the switch as updated (i.e. not freshly rebooted/wiped) on a nonzero value.
-		if src != nil && value != 0 {
-			atomic.StoreUint32(&src.switchUpdated, 1)
-		}
-		sc.updateSwitchIndex(0, value)
-		// Passing 0 here is fine; releasePendingBatches doesn't do anything if either arg is 0.
-		sc.releasePendingBatches(marker, value)
-		if sc.raft != nil {
-			genMsg := raftpb.Message{
-				Type:  raftpb.MsgAskAckIndexResp,
-				To:    to,
-				From:  from,
-				Index: value,
-			}
-			if err := sc.raft.Process(sc.ctx, genMsg); err != nil {
-				sc.lg.Warn("failed to process MsgAskAckIndexResp via Raft",
-					zap.Error(err))
-			}
-		}
+		sc.creditSwitchReply(peer, m)
 	default:
 		sc.lg.Warn("received UDP sidechannel message with unknown type",
-			zap.Uint8("type", uint8(msgType)))
+			zap.Uint8("type", m.msgType))
+	}
+}
+
+// creditSwitchReply hands raft the credit in a switch's reply to a write or
+// ask on peer's path: a promise that every later stamp that switch gives is
+// at least m.value.
+//
+// The promise only holds within one switch boot, so a reply is credited only
+// if it carries the switch's current boot ID; one from any other boot (sent
+// before a reboot and delivered late) is dropped. Replies never change the
+// boot ID; only a NACK does (handleSwitchNack).
+//
+// The credit is capped at this node's high-water mark. A register value above
+// it can only come from another (deposed) leader's write; crediting it would
+// put the credit above what a re-seed after the next reboot writes. A smaller
+// credit is always safe: it only lets the leader commit less without the
+// holder's own ack, and the leader cannot commit beyond its own proposals.
+func (sc *UdpSidechannel) creditSwitchReply(peer *udpPeerInfo, m sidechannelMsg) {
+	// Read the high-water mark before the boot check. If the check passes, any
+	// adoption of a newer boot comes after this read, and its re-seed then
+	// writes at least this much, covering the credit below.
+	highWater := atomic.LoadUint64(&sc.highWater)
+	if m.bootID != atomic.LoadUint32(&peer.sw.bootID) {
+		return
+	}
+	sc.updateSwitchIndex(0, switchStamp{index: m.value, term: m.term})
+	if m.value == 0 {
+		// Nothing written on this boot yet: no information, and no credit.
+		return
+	}
+	// Mark the switch as updated (i.e. not freshly rebooted/wiped).
+	atomic.StoreUint32(&peer.switchUpdated, 1)
+	credit := min(m.value, highWater)
+	if credit == 0 {
+		return // nothing proposed yet
+	}
+	if sc.raft != nil {
+		genMsg := raftpb.Message{
+			Type:  raftpb.MsgAskAckIndexResp,
+			To:    m.to,
+			From:  m.from,
+			Index: credit,
+		}
+		if err := sc.raft.Process(sc.ctx, genMsg); err != nil {
+			sc.lg.Warn("failed to process MsgAskAckIndexResp via Raft",
+				zap.Error(err))
+		}
+	}
+}
+
+// handleSwitchNack handles a switch refusing a write on peer's path because
+// it carried the wrong boot ID. The NACK names the switch's boot ID, and its
+// marker echoes the boot ID the write was sent under.
+//
+// The switch's boot ID is adopted only if the NACK answers a write sent under
+// the boot ID this node currently believes, i.e. it refutes the current
+// belief. A NACK delayed from an earlier boot answers an older belief and is
+// ignored; adopting it would roll every path back to a dead boot. On adoption
+// the dedupe state of every path crossing the switch is cleared, so their next
+// MsgApp copies go out under the new boot ID.
+//
+// Then, if the NACK's boot ID is current, the path is re-seeded with the
+// high-water mark: a switch accepts no write, and so stamps nothing usable,
+// until one carrying its boot ID lands. A re-seed that is lost is retried by
+// the next MsgApp copy or by RefreshIdleSwitches.
+func (sc *UdpSidechannel) handleSwitchNack(peer *udpPeerInfo, m sidechannelMsg) {
+	if m.bootID == 0 {
+		return // never reported by a switch
+	}
+	sw := peer.sw
+	cur := atomic.LoadUint32(&sw.bootID)
+	if m.marker == uint64(cur) && m.bootID != cur &&
+		atomic.CompareAndSwapUint32(&sw.bootID, cur, m.bootID) {
+		sc.lg.Info("UDP sidechannel switch boot ID changed; re-seeding",
+			zap.String("peerID", peer.id.String()),
+			zap.Uint16("magic", peer.magic),
+			zap.Uint32("bootID", m.bootID))
+		sc.peers.Range(func(_, v any) bool {
+			if p := v.(*udpPeerInfo); p.sw == sw {
+				p.resetLastSent()
+			}
+			return true
+		})
+	}
+	if m.bootID == atomic.LoadUint32(&sw.bootID) {
+		sc.refreshPeerSwitch(peer)
 	}
 }
 
@@ -399,44 +612,38 @@ func (sc *UdpSidechannel) ProcessOutgoingMessage(m *raftpb.Message) {
 		return
 	}
 
-	sideChannelMsg := udpSidechannelMsg{conn: peer.conn, remote: peer.remote, peerID: peer.id}
 	switch m.Type {
 	case raftpb.MsgApp:
-		proposedIndex := m.Index + uint64(len(m.Entries))
-		// The switch only needs the latest proposed index for a peer.
-		// Skip MsgApps that don't advance it.
-		for {
-			last := atomic.LoadUint64(&peer.lastSentIndex)
-			if proposedIndex <= last {
-				return
-			}
-			if atomic.CompareAndSwapUint64(&peer.lastSentIndex, last, proposedIndex) {
-				break
-			}
+		// Every write carries the node-wide high-water mark, not this MsgApp's
+		// own end index: a lagging peer's MsgApps end below indexes the switch
+		// has already reflected, and after a reboot whichever write lands first
+		// must cover all of them (SAFE-1). The term is the MsgApp's own, a term
+		// in which this node was leader; never the node's current term, which a
+		// deposed leader may already have advanced.
+		bootID := atomic.LoadUint32(&peer.sw.bootID) // before the high-water mark; see switchWrite
+		testHookBetweenBootAndHighWater()
+		highWater := atomicMax(&sc.highWater, m.Index+uint64(len(m.Entries)))
+		atomicMax(&sc.leaderTerm, m.Term)
+		if !peer.recordLastSent(m.Term, highWater) {
+			return
 		}
-		binary.BigEndian.PutUint16(sideChannelMsg.msg[0:2], peer.magic)
-		sideChannelMsg.msg[2] = byte(raftpb.MsgApp)
-		binary.BigEndian.PutUint64(sideChannelMsg.msg[3:11], uint64(peer.id))
-		binary.BigEndian.PutUint64(sideChannelMsg.msg[11:19], uint64(sc.id))
-		binary.BigEndian.PutUint64(sideChannelMsg.msg[19:27], 0)
-		binary.BigEndian.PutUint64(sideChannelMsg.msg[27:35], proposedIndex)
-		sc.enqueue(sideChannelMsg)
+		sc.enqueue(sc.switchWrite(peer, bootID, highWater, m.Term))
 	case raftpb.MsgAskAckIndex:
-		binary.BigEndian.PutUint16(sideChannelMsg.msg[0:2], peer.magic)
-		sideChannelMsg.msg[2] = byte(raftpb.MsgAskAckIndex)
-		binary.BigEndian.PutUint64(sideChannelMsg.msg[3:11], uint64(peer.id))
-		binary.BigEndian.PutUint64(sideChannelMsg.msg[11:19], uint64(sc.id))
-		binary.BigEndian.PutUint64(sideChannelMsg.msg[19:27], 0)
-		binary.BigEndian.PutUint64(sideChannelMsg.msg[27:35], 0)
-		sc.enqueue(sideChannelMsg)
+		sc.enqueue(udpSidechannelMsg{conn: peer.conn, remote: peer.remote, peerID: peer.id,
+			msg: sidechannelMsg{
+				magic:   peer.magic,
+				msgType: byte(raftpb.MsgAskAckIndex),
+				to:      uint64(peer.id),
+				from:    uint64(sc.id),
+			}.encode()})
 	default:
 		sc.lg.Error("Somehow got to default case of ProcessOutgoingMessage(), should never happen")
 	}
 }
 
 // RefreshIdleSwitches re-sends, to every peer whose switch has said nothing
-// since the previous call, the highest proposed index we have already sent to that
-// peer. Only the leader can do this; it is the only node allowed to update switch indexes.
+// since the previous call, this node's high-water mark. Only the leader can do
+// this; it is the only node allowed to update switch indexes.
 //
 // This is necessary because the switch register is only ever updated by a proposed write,
 // so a rebooted switch (register reset to 0) has no way to recover if the
@@ -468,26 +675,49 @@ func (sc *UdpSidechannel) RefreshIdleSwitches(holders []uint64) {
 	}
 }
 
-// refreshPeerSwitch re-sends the highest proposed index already sent to this
-// peer, restoring the register on that peer's path.
+// refreshPeerSwitch writes this node's high-water mark to the switch on
+// peer's path, under the path's known boot ID and the last term this node led.
+// It restores a register that a reboot emptied, and is the re-seed after a NACK.
+// It bypasses the MsgApp dedupe on purpose: it is a retransmission.
 func (sc *UdpSidechannel) refreshPeerSwitch(peer *udpPeerInfo) {
-	lastSent := atomic.LoadUint64(&peer.lastSentIndex)
-	if lastSent == 0 {
-		// Never tapped anything for this peer; nothing to restore.
+	bootID := atomic.LoadUint32(&peer.sw.bootID) // before the high-water mark; see switchWrite
+	testHookBetweenBootAndHighWater()
+	highWater := atomic.LoadUint64(&sc.highWater)
+	if highWater == 0 {
+		// Never tapped anything; nothing to restore.
 		return
 	}
+	sc.enqueue(sc.switchWrite(peer, bootID, highWater, atomic.LoadUint64(&sc.leaderTerm)))
+}
 
-	// We don't use ProcessOutgoingMessage on purpose, this is a retransmission:
-	// ProcessOutgoingMessage CASes lastSentIndex (we don't want to modify it here) and it only sends
-	// on a strictly higher index, so it would refuse to re-send a value it has already sent.
-	msg := udpSidechannelMsg{conn: peer.conn, remote: peer.remote, peerID: peer.id}
-	binary.BigEndian.PutUint16(msg.msg[0:2], peer.magic)
-	msg.msg[2] = byte(raftpb.MsgApp)
-	binary.BigEndian.PutUint64(msg.msg[3:11], uint64(peer.id))
-	binary.BigEndian.PutUint64(msg.msg[11:19], uint64(sc.id))
-	binary.BigEndian.PutUint64(msg.msg[19:27], 0)
-	binary.BigEndian.PutUint64(msg.msg[27:35], lastSent)
-	sc.enqueue(msg)
+// testHookBetweenBootAndHighWater runs between a write's boot ID load and its
+// high-water mark read. Tests only.
+var testHookBetweenBootAndHighWater = func() {}
+
+// switchWrite builds a write (MsgApp) of highWater at term to the switch on
+// peer's path, under bootID. The switch applies it only if that boot ID is its
+// own and NACKs it otherwise. The marker carries the same boot ID, which the
+// switch echoes, so a NACK names the belief it refutes (see handleSwitchNack).
+// The switch carries the term in 32 bits.
+//
+// Callers must load bootID BEFORE reading highWater. A write under a newly
+// adopted boot ID must carry at least every credit given under the old one,
+// and those credits were capped at a high-water mark read before the adoption.
+// Read in the other order, a write could take a low mark, stall across a
+// credit and an adoption, then go out under the new boot ID and land below the
+// credit before the adoption's re-seed does.
+func (sc *UdpSidechannel) switchWrite(peer *udpPeerInfo, bootID uint32, highWater, term uint64) udpSidechannelMsg {
+	return udpSidechannelMsg{conn: peer.conn, remote: peer.remote, peerID: peer.id,
+		msg: sidechannelMsg{
+			magic:   peer.magic,
+			msgType: byte(raftpb.MsgApp),
+			to:      uint64(peer.id),
+			from:    uint64(sc.id),
+			marker:  uint64(bootID),
+			value:   highWater,
+			bootID:  bootID,
+			term:    uint32(term),
+		}.encode()}
 }
 
 // querySwitchIndexLoop asks the switch for its register to ungate reads that have been waiting on
@@ -610,13 +840,13 @@ func (sc *UdpSidechannel) QuerySwitchIndex(marker uint64) error {
 		return fmt.Errorf("no connected peers for switch index query")
 	}
 
-	var msg [35]byte
-	binary.BigEndian.PutUint16(msg[0:2], sc.magic) // Use our own magic, we want our switch
-	msg[2] = byte(raftpb.MsgAskAckIndex)
-	binary.BigEndian.PutUint64(msg[3:11], uint64(sc.id)) // Use our own ID
-	binary.BigEndian.PutUint64(msg[11:19], uint64(sc.id))
-	binary.BigEndian.PutUint64(msg[19:27], marker)
-	binary.BigEndian.PutUint64(msg[27:35], 0)
+	msg := sidechannelMsg{
+		magic:   sc.magic, // Use our own magic, we want our switch
+		msgType: byte(raftpb.MsgAskAckIndex),
+		to:      uint64(sc.id), // Use our own ID
+		from:    uint64(sc.id),
+		marker:  marker,
+	}.encode()
 
 	_, err := sc.conn.WriteToUDP(msg[:], peer.remote)
 	if err != nil {
@@ -680,13 +910,15 @@ func (sc *UdpSidechannel) AttachPeer(id types.ID, ipStr string, portStr string, 
 			zap.String("newMagic", magicStr))
 		// Hot-path readers access peer fields without a lock, so publish a fresh
 		// immutable struct rather than mutating the existing one in place.
+		// A changed path may cross a different switch (its magic says which),
+		// and its dedupe state starts over.
 		newPeer := &udpPeerInfo{
-			id:            id,
-			remote:        remote,
-			magic:         magic,
-			conn:          sc.dialPeer(id, remote),
-			refcount:      peer.refcount + 1,
-			lastSentIndex: atomic.LoadUint64(&peer.lastSentIndex),
+			id:       id,
+			remote:   remote,
+			magic:    magic,
+			sw:       sc.switchFor(magic),
+			conn:     sc.dialPeer(id, remote),
+			refcount: peer.refcount + 1,
 		}
 		sc.peers.Store(id, newPeer)
 		// Closing the old socket unblocks its peerReadLoop, which then exits.
@@ -703,6 +935,7 @@ func (sc *UdpSidechannel) AttachPeer(id types.ID, ipStr string, portStr string, 
 		id:       id,
 		remote:   remote,
 		magic:    magic,
+		sw:       sc.switchFor(magic),
 		conn:     sc.dialPeer(id, remote),
 		refcount: 1,
 	}
@@ -747,7 +980,7 @@ func (sc *UdpSidechannel) peerReadLoop(peer *udpPeerInfo) {
 				zap.String("peerID", peer.id.String()), zap.Error(err))
 			continue
 		}
-		if n < 35 {
+		if n < udpSidechannelMsgLen {
 			sc.lg.Warn("received UDP sidechannel message with invalid length",
 				zap.Int("length", n))
 			continue
@@ -804,7 +1037,8 @@ func MagicFromStr(s string) (uint16, error) {
 
 // WaitForReadGate blocks until the switch answers nonzero for the given marker, either via
 // a tagged UDP reflection of the client's own read-gate packet, or a batched
-// local query that releases it. It returns the index the switch reported.
+// local query that releases it. It returns the index the switch reported and the
+// term it stamped with it; raft uses the index only in that term (SAFE-1).
 //
 // After ReadGateDeadlineMillis it gives up and returns MaxUint64,
 // meaning "no known switch marker for this read"; this causes a leaseholding raft follower
@@ -812,7 +1046,7 @@ func MagicFromStr(s string) (uint16, error) {
 // commit index of MaxUint64.
 //
 // Only the caller's own deadline produces an error, which is a genuinely failed read.
-func (sc *UdpSidechannel) WaitForReadGate(ctx context.Context, marker uint64) (uint64, error) {
+func (sc *UdpSidechannel) WaitForReadGate(ctx context.Context, marker uint64) (index uint64, term uint64, err error) {
 	if marker == 0 {
 		// Marker-less read (client not speaking the assist protocol): mint a
 		// server-side marker from markerSeq. These have an upper 32 bits of 0,
@@ -822,15 +1056,15 @@ func (sc *UdpSidechannel) WaitForReadGate(ctx context.Context, marker uint64) (u
 		marker = atomic.AddUint64(&sc.readGate.markerSeq, 1)
 	}
 
-	ch := make(chan uint64, 1)
+	ch := make(chan switchStamp, 1)
 	sc.readGate.pending.Store(marker, ch)
 
 	// UDP normally beats TCP, so the switch marker usually arrives first.
 	// This MUST be after pending.Store(),
 	// else there's a gap where a marker can arrive and isn't consumed.
-	if val, ok := sc.readGate.resolved.take(marker); ok {
+	if stamp, ok := sc.readGate.resolved.take(marker); ok {
 		sc.readGate.pending.Delete(marker)
-		return val, nil
+		return stamp.index, uint64(stamp.term), nil
 	}
 
 	gateTimer := time.NewTimer(ReadGateDeadlineMillis * time.Millisecond)
@@ -848,22 +1082,22 @@ func (sc *UdpSidechannel) WaitForReadGate(ctx context.Context, marker uint64) (u
 		// than parking here (same outcome as the wait below).
 		sc.readGate.pending.Delete(marker)
 		atomic.AddUint64(&sc.readGate.gateTimeouts, 1)
-		return math.MaxUint64, nil
+		return math.MaxUint64, 0, nil
 	case <-ctx.Done():
 		sc.readGate.pending.Delete(marker)
-		return 0, ctx.Err()
+		return 0, 0, ctx.Err()
 	}
 
 	select {
-	case switchIndex := <-ch:
-		return switchIndex, nil
+	case stamp := <-ch:
+		return stamp.index, uint64(stamp.term), nil
 	case <-gateTimer.C:
 		sc.readGate.pending.Delete(marker)
 		atomic.AddUint64(&sc.readGate.gateTimeouts, 1)
-		return math.MaxUint64, nil
+		return math.MaxUint64, 0, nil
 	case <-ctx.Done():
 		sc.readGate.pending.Delete(marker)
-		return 0, ctx.Err()
+		return 0, 0, ctx.Err()
 	}
 }
 
@@ -883,15 +1117,17 @@ func (sc *UdpSidechannel) SwitchGateStats() (zeroAnswers, gateTimeouts uint64) {
 // updateSwitchIndex records a switch observation and resolves the marker it
 // answers, if any.
 //
-// A switchIndex of 0 is discarded outright, as it means we have gained no information.
+// A stamp with a zero index or term is discarded outright, as it means we have
+// gained no information: the switch has accepted no write since it booted.
 //
 // Because markers are minted per read, a matching tagged answer proves the switch's register
 // held the returned index at some time AFTER the read began.
-func (sc *UdpSidechannel) updateSwitchIndex(marker, switchIndex uint64) {
-	if switchIndex == 0 {
+func (sc *UdpSidechannel) updateSwitchIndex(marker uint64, stamp switchStamp) {
+	if stamp.index == 0 || stamp.term == 0 {
 		atomic.AddUint64(&sc.readGate.zeroAnswers, 1)
 		return
 	}
+	switchIndex := stamp.index
 
 	// Update the latest index atomically
 	for {
@@ -913,18 +1149,18 @@ func (sc *UdpSidechannel) updateSwitchIndex(marker, switchIndex uint64) {
 
 	// Resolve the per-marker channel if present
 	if val, ok := sc.readGate.pending.LoadAndDelete(marker); ok {
-		ch := val.(chan uint64)
+		ch := val.(chan switchStamp)
 		select {
-		case ch <- switchIndex: // Channel can never be full
+		case ch <- stamp: // Channel can never be full
 		default:
 		}
 	} else { // Add the marker to resolved, this probably arrived first
-		sc.readGate.resolved.store(marker, switchIndex)
+		sc.readGate.resolved.store(marker, stamp)
 		// This is ugly, but one of the two sides has to check one of the maps twice
 		if val, ok := sc.readGate.pending.LoadAndDelete(marker); ok {
-			ch := val.(chan uint64)
+			ch := val.(chan switchStamp)
 			select {
-			case ch <- switchIndex:
+			case ch <- stamp:
 			default:
 			}
 			sc.readGate.resolved.remove(marker)
@@ -933,8 +1169,8 @@ func (sc *UdpSidechannel) updateSwitchIndex(marker, switchIndex uint64) {
 }
 
 // releasePendingBatches releases every batch at or below batchMarker, handing
-// each waiting read answeredIndex, which is the value the switch actually returned for
-// this query, NOT the node-global maximum.
+// each waiting read the stamp the switch actually returned for this query,
+// NOT the node-global maximum.
 //
 // That value is a valid stamp for every marker released here: the query was
 // sent after each of those reads entered the gate, so its answer describes the
@@ -942,8 +1178,8 @@ func (sc *UdpSidechannel) updateSwitchIndex(marker, switchIndex uint64) {
 // Handing out the global max instead would gate reads on an index a later, unrelated read happened
 // to observe, holding them at the follower for writes that may have began after the read.
 // In a write-heavy workload this can mean reads are unduly delayed.
-func (sc *UdpSidechannel) releasePendingBatches(batchMarker, answeredIndex uint64) {
-	if batchMarker == 0 || answeredIndex == 0 {
+func (sc *UdpSidechannel) releasePendingBatches(batchMarker uint64, answered switchStamp) {
+	if batchMarker == 0 || answered.index == 0 || answered.term == 0 {
 		return
 	}
 
@@ -957,9 +1193,9 @@ func (sc *UdpSidechannel) releasePendingBatches(batchMarker, answeredIndex uint6
 		}
 		for _, marker := range batch.markers {
 			if val, ok := sc.readGate.pending.LoadAndDelete(marker); ok {
-				ch := val.(chan uint64)
+				ch := val.(chan switchStamp)
 				select {
-				case ch <- answeredIndex:
+				case ch <- answered:
 				default:
 				}
 			}

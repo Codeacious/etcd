@@ -15,6 +15,7 @@
 package etcdserver
 
 import (
+	"math"
 	"sync"
 	"testing"
 )
@@ -43,7 +44,7 @@ func TestReadHintHandoffNeverLosesAReader(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			hint := uint64(i + 1)
-			nc := s.captureReadNotifier(hint)
+			nc := s.captureReadNotifier(hint, 7)
 			mu.Lock()
 			captured[nc] = append(captured[nc], hint)
 			mu.Unlock()
@@ -57,14 +58,14 @@ func TestReadHintHandoffNeverLosesAReader(t *testing.T) {
 	go func() {
 		defer loopWG.Done()
 		for {
-			nr, hint := s.swapReadNotifier()
+			nr, hint, _ := s.swapReadNotifier()
 			mu.Lock()
 			observed[nr] = hint
 			mu.Unlock()
 			select {
 			case <-done:
 				// One final swap so the last readers' notifier is drained too.
-				nr, hint := s.swapReadNotifier()
+				nr, hint, _ := s.swapReadNotifier()
 				mu.Lock()
 				observed[nr] = hint
 				mu.Unlock()
@@ -99,18 +100,18 @@ func TestReadHintHandoffNeverLosesAReader(t *testing.T) {
 func TestReadHintZeroContributesNothing(t *testing.T) {
 	s := &EtcdServer{readNotifier: newNotifier()}
 
-	s.captureReadNotifier(0)
-	s.captureReadNotifier(0)
-	if _, hint := s.swapReadNotifier(); hint != 0 {
+	s.captureReadNotifier(0, 0)
+	s.captureReadNotifier(0, 0)
+	if _, hint, _ := s.swapReadNotifier(); hint != 0 {
 		t.Fatalf("hint = %d, want 0 when no reader needs a switch", hint)
 	}
 
 	// A mixed round takes the max: one gated reader forces its requirement on
 	// the round even if others contribute nothing.
-	s.captureReadNotifier(0)
-	s.captureReadNotifier(900)
-	s.captureReadNotifier(0)
-	if _, hint := s.swapReadNotifier(); hint != 900 {
+	s.captureReadNotifier(0, 0)
+	s.captureReadNotifier(900, 7)
+	s.captureReadNotifier(0, 0)
+	if _, hint, _ := s.swapReadNotifier(); hint != 900 {
 		t.Fatalf("hint = %d, want 900", hint)
 	}
 }
@@ -120,11 +121,39 @@ func TestReadHintZeroContributesNothing(t *testing.T) {
 func TestReadHintDrainsPerRound(t *testing.T) {
 	s := &EtcdServer{readNotifier: newNotifier()}
 
-	s.captureReadNotifier(1200)
-	if _, hint := s.swapReadNotifier(); hint != 1200 {
-		t.Fatalf("first round hint = %d, want 1200", hint)
+	s.captureReadNotifier(1200, 7)
+	if _, hint, term := s.swapReadNotifier(); hint != 1200 || term != 7 {
+		t.Fatalf("first round hint = %d at term %d, want 1200 at 7", hint, term)
 	}
-	if _, hint := s.swapReadNotifier(); hint != 0 {
-		t.Fatalf("second round hint = %d, want it drained to 0", hint)
+	if _, hint, term := s.swapReadNotifier(); hint != 0 || term != 0 {
+		t.Fatalf("second round hint = %d at term %d, want both drained to 0", hint, term)
+	}
+}
+
+// TestReadHintTermPerRound: raft uses a round's hint only in the term the
+// switch stamped it with (SAFE-1). A round whose readers were stamped in one
+// term carries that term; readers stamped in different terms cannot all be
+// checked, so the round must not be served locally at all.
+func TestReadHintTermPerRound(t *testing.T) {
+	s := &EtcdServer{readNotifier: newNotifier()}
+
+	s.captureReadNotifier(500, 7)
+	s.captureReadNotifier(600, 7)
+	s.captureReadNotifier(0, 0) // no stamp: contributes no term
+	if _, hint, term := s.swapReadNotifier(); hint != 600 || term != 7 {
+		t.Fatalf("one-term round = %d at term %d, want 600 at 7", hint, term)
+	}
+
+	s.captureReadNotifier(500, 7)
+	s.captureReadNotifier(400, 8)
+	if _, hint, _ := s.swapReadNotifier(); hint != math.MaxUint64 {
+		t.Fatalf("mixed-term round hint = %d, want MaxUint64 (forward)", hint)
+	}
+
+	// A reader that already gave up (MaxUint64) forwards the round whatever the term.
+	s.captureReadNotifier(500, 7)
+	s.captureReadNotifier(math.MaxUint64, 0)
+	if _, hint, _ := s.swapReadNotifier(); hint != math.MaxUint64 {
+		t.Fatalf("round with a timed-out reader = %d, want MaxUint64", hint)
 	}
 }
