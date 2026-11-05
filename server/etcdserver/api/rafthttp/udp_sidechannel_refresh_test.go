@@ -290,7 +290,7 @@ func TestUnstampedReadIndexLeavesCacheAlone(t *testing.T) {
 	sc := newRefreshTestSidechannel(t)
 	sc.updateSwitchIndex(0, switchStamp{index: 500, term: testTerm})
 
-	sc.handleUdpSidechannelMsg(encodeReadIndexReflection(sc, 1, 0), nil)
+	sc.handleUdpSidechannelMsg(encodeReadIndexReflection(sc, 0xABCD00000001, 0), nil)
 
 	if got := sc.LatestSwitchIndex(); got != 500 {
 		t.Fatalf("cached switch index = %d after a zero answer, want it held at 500", got)
@@ -508,12 +508,12 @@ func TestQuerySwitchIndexLoopDropsDeadBatches(t *testing.T) {
 	addRefreshTestPeer(sc, 2)
 
 	// Two batches whose markers are long gone, plus one live marker. Push
-	// markerSeq past them so the loop's own batch markers cannot collide.
+	// batchSeq past them so the loop's own batch markers cannot collide.
 	sc.readGate.pendingBatches = []pendingMarkerBatch{
 		{localMarker: 1, markers: []uint64{0xDEAD01}},
 		{localMarker: 2, markers: []uint64{0xDEAD02}},
 	}
-	sc.readGate.markerSeq = 1000
+	sc.readGate.batchSeq = 1000
 	const live = uint64(0xFEED02)
 	sc.readGate.pending.Store(live, make(chan switchStamp, 1))
 

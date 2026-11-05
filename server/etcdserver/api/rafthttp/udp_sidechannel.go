@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"net"
 	"os"
 	"strconv"
@@ -38,8 +39,10 @@ const (
 	ReadGateDeadlineMillis = 50
 
 	// resolvedMarkerTTL bounds how long a switch answer that arrived before its
-	// read is kept waiting for that read to claim it. Rotation is by generation,
-	// so an entry actually lives between one and two of these.
+	// read is kept waiting for that read to claim it. Rotation is by generation
+	// and happens only on store, so an entry lives between one and two of these
+	// while answers keep arriving, and longer when they stop. Safety does not
+	// rely on it: markers do not recur (see isClientMarker).
 	// Keep this long- it's only to stop memory leaking by clearing the resolved marker map.
 	resolvedMarkerTTL = time.Second
 
@@ -121,7 +124,7 @@ type readGateAsk struct {
 }
 
 // resolvedMarkers are stamped switch indexes for reads that arrive before the actual client read.
-// We maintain a 'current' and 'previous' map that gets shifted back every resolvedMarkerTTL.
+// We maintain a 'current' and 'previous' map that a store shifts back once resolvedMarkerTTL has passed since the last shift.
 type resolvedMarkers struct {
 	mu         sync.RWMutex
 	curr       map[uint64]switchStamp // on resolvedMarkerTTL -> move curr to prev
@@ -219,6 +222,22 @@ type UdpSidechannel struct {
 	// switches maps a switch's magic (unique per switch by configuration) to
 	// what this node knows about it. Every path crossing a switch shares it.
 	switches sync.Map // uint16 -> *switchState
+
+	// leaseHolders is the peers holding a read lease from this node, as of the
+	// leader's last switch-monitor tick (nil when not leader). A switch reply
+	// is credited to every one of them behind that switch.
+	leaseHolders atomic.Pointer[[]uint64]
+}
+
+// SetLeaseHolders records the peers currently holding a read lease from this
+// node (raft's Status().ActiveReadLeases), or nil when this node isn't leader.
+func (sc *UdpSidechannel) SetLeaseHolders(holders []uint64) {
+	if holders == nil {
+		sc.leaseHolders.Store(nil)
+		return
+	}
+	hs := append([]uint64(nil), holders...)
+	sc.leaseHolders.Store(&hs)
 }
 
 // switchState is what this node knows about one switch.
@@ -289,7 +308,9 @@ type SwitchReadGate struct {
 	gateTimeouts       uint64   // atomic: reads that gave up waiting and forwarded
 	pending            sync.Map // map of read gate markers that need to be released
 	resolved           *resolvedMarkers
-	markerSeq          uint64 // atomic: marker counter for server-initiated queries
+	markerSeq          uint64 // atomic: counter for server-minted read markers (marker-less reads); see nextReadMarker
+	batchIncarnation   uint32 // random, nonzero upper half of this instance's batch markers; see nextBatchMarker
+	batchSeq           uint32 // atomic: lower half of the last batch marker minted
 	pendingMarkers     chan readGateAsk
 	pendingBatches     []pendingMarkerBatch // batches of markers that have had a local switch query initiated
 	pendingBatchesLock sync.Mutex
@@ -298,6 +319,55 @@ type SwitchReadGate struct {
 type pendingMarkerBatch struct {
 	localMarker uint64
 	markers     []uint64
+}
+
+// newBatchIncarnation returns a random, nonzero batch-marker upper half.
+func newBatchIncarnation() uint32 {
+	if inc := rand.Uint32(); inc != 0 {
+		return inc
+	}
+	return 1
+}
+
+// nextBatchMarker mints the marker for a new QuerySwitchIndex batch:
+// batchIncarnation in the upper 32 bits, the batch sequence in the lower 32.
+//
+// SAFE-3: a counter restarting at 1 on every boot let a query reply delayed
+// across a restart release this instance's batches (release is cumulative,
+// see releasePendingBatches) with a register value read before their reads
+// began. A random incarnation per instance makes such replies identifiable,
+// and the reply path drops them. Mirrors the incarnation in raft's lease ids.
+//
+// Batch markers never enter pending, and travel only in this node's own
+// queries and their replies (to == from == self), so they cannot meet a
+// client marker despite the nonzero upper half. Server-minted read markers
+// stay in the zero-upper-32 namespace (markerSeq).
+//
+// The sequence wraps within the lower 32 bits, keeping the incarnation;
+// releasePendingBatches compares it wrap-safely.
+func (g *SwitchReadGate) nextBatchMarker() uint64 {
+	return uint64(g.batchIncarnation)<<32 | uint64(atomic.AddUint32(&g.batchSeq, 1))
+}
+
+// isClientMarker reports whether a marker lies in the client namespace: a
+// nonzero upper 32 bits (see sidechannel.NewMarkerSeed). The zero-upper-32
+// namespace belongs to this node's server-minted read markers.
+func isClientMarker(marker uint64) bool { return marker>>32 != 0 }
+
+// nextReadMarker mints a server-side marker for a marker-less read. It stays in
+// the zero-upper-32 namespace, wrapping within the lower 32 bits and skipping
+// 0, so it can never alias a client marker (SAFE-7).
+//
+// Read markers restart at 1 on every boot. That is safe because they never go
+// on the wire: only a batch release (incarnation-checked, SAFE-3) or a reflected
+// client MsgReadIndex can resolve one, and the latter is dropped unless its
+// marker is in the client namespace.
+func (g *SwitchReadGate) nextReadMarker() uint64 {
+	for {
+		if m := atomic.AddUint64(&g.markerSeq, 1) & math.MaxUint32; m != 0 {
+			return m
+		}
+	}
 }
 
 func (sc *UdpSidechannel) SetGateActiveChecker(f func() bool) { sc.gateActive = f }
@@ -329,9 +399,10 @@ func NewUdpSidechannel(id types.ID, ip string, port int, magic uint16, r Raft, l
 		lg:     lg,
 		magic:  magic,
 		readGate: &SwitchReadGate{
-			markerSeq:      1,
-			pendingMarkers: make(chan readGateAsk, 256),
-			resolved:       newResolvedMarkers(),
+			markerSeq:        1,
+			batchIncarnation: newBatchIncarnation(),
+			pendingMarkers:   make(chan readGateAsk, 256),
+			resolved:         newResolvedMarkers(),
 		},
 		raft: r,
 	}
@@ -410,6 +481,14 @@ func (sc *UdpSidechannel) handleUdpSidechannelMsg(buf []byte, src *udpPeerInfo) 
 		if sc.gateActive != nil && !sc.gateActive() {
 			return
 		}
+		// SAFE-7: a zero-upper-32 marker aliases this node's server-minted read
+		// markers. Resolving one could hand a marker-less read a stamp taken
+		// before that read began, so the packet is dropped whole.
+		if !isClientMarker(m.marker) {
+			sc.lg.Debug("dropped MsgReadIndex with a marker outside the client namespace",
+				zap.Uint64("marker", m.marker))
+			return
+		}
 		sc.updateSwitchIndex(m.marker, switchStamp{index: m.value, term: m.term})
 		return
 	}
@@ -422,6 +501,14 @@ func (sc *UdpSidechannel) handleUdpSidechannelMsg(buf []byte, src *udpPeerInfo) 
 			return
 		}
 		if msgType == raftpb.MsgAskAckIndexResp {
+			// SAFE-3: an answer to a query an earlier instance of this node
+			// sent. Its value may predate every read now waiting, so it must
+			// release none of them.
+			if uint32(m.marker>>32) != sc.readGate.batchIncarnation {
+				sc.lg.Debug("dropped UDP sidechannel query reply from another incarnation",
+					zap.Uint64("marker", m.marker))
+				return
+			}
 			// The marker could be for a batch of requests.
 			stamp := switchStamp{index: m.value, term: m.term}
 			sc.updateSwitchIndex(0, stamp)
@@ -501,17 +588,41 @@ func (sc *UdpSidechannel) creditSwitchReply(peer *udpPeerInfo, m sidechannelMsg)
 	if credit == 0 {
 		return // nothing proposed yet
 	}
-	if sc.raft != nil {
-		genMsg := raftpb.Message{
-			Type:  raftpb.MsgAskAckIndexResp,
-			To:    m.to,
-			From:  m.from,
-			Index: credit,
+	sc.injectCredit(m.to, m.from, credit)
+
+	// Credit every other lease holder behind this switch too, not just the
+	// follower whose path carried the write: the switch's one register stamps
+	// all of their reads, so its promise covers each of them. The commit clamp
+	// then lifts on the first reply through the switch rather than the slowest
+	// path's. Others are credited only if they held a lease at the last
+	// monitor tick; raft ignores, and logs, a credit to a non-holder.
+	if hs := sc.leaseHolders.Load(); hs != nil {
+		for _, id := range *hs {
+			if id == m.from {
+				continue
+			}
+			if v, ok := sc.peers.Load(types.ID(id)); ok && v.(*udpPeerInfo).sw == peer.sw {
+				sc.injectCredit(m.to, id, credit)
+			}
 		}
-		if err := sc.raft.Process(sc.ctx, genMsg); err != nil {
-			sc.lg.Warn("failed to process MsgAskAckIndexResp via Raft",
-				zap.Error(err))
-		}
+	}
+}
+
+// injectCredit hands raft a switch credit for follower from: a Term-0
+// MsgAskAckIndexResp raising that holder's grant to index.
+func (sc *UdpSidechannel) injectCredit(to, from, index uint64) {
+	if sc.raft == nil {
+		return
+	}
+	genMsg := raftpb.Message{
+		Type:  raftpb.MsgAskAckIndexResp,
+		To:    to,
+		From:  from,
+		Index: index,
+	}
+	if err := sc.raft.Process(sc.ctx, genMsg); err != nil {
+		sc.lg.Warn("failed to process MsgAskAckIndexResp via Raft",
+			zap.Error(err))
 	}
 }
 
@@ -792,7 +903,7 @@ func (sc *UdpSidechannel) querySwitchIndexLoop() {
 			waiting = live
 
 			if len(askingBatch) > 0 {
-				batchMarker := atomic.AddUint64(&sc.readGate.markerSeq, 1)
+				batchMarker := sc.readGate.nextBatchMarker()
 
 				sc.readGate.pendingBatchesLock.Lock()
 				// Drop batches with nothing left waiting on them.
@@ -1047,13 +1158,13 @@ func MagicFromStr(s string) (uint16, error) {
 //
 // Only the caller's own deadline produces an error, which is a genuinely failed read.
 func (sc *UdpSidechannel) WaitForReadGate(ctx context.Context, marker uint64) (index uint64, term uint64, err error) {
-	if marker == 0 {
-		// Marker-less read (client not speaking the assist protocol): mint a
-		// server-side marker from markerSeq. These have an upper 32 bits of 0,
-		// a namespace clients never use (see sidechannel.NewMarkerSeed), so they
-		// can't collide with a reflected client marker.
-		// querySwitchIndexLoop's batched query will resolve this new marker.
-		marker = atomic.AddUint64(&sc.readGate.markerSeq, 1)
+	if !isClientMarker(marker) {
+		// Marker-less read (client not speaking the assist protocol), or a
+		// client marker in the server namespace (SAFE-7: treated as none, since
+		// its reflection is dropped). Mint a server-side marker; the zero-upper-32
+		// namespace is never accepted from a reflected client marker, so the two
+		// can't collide. querySwitchIndexLoop's batched query will resolve it.
+		marker = sc.readGate.nextReadMarker()
 	}
 
 	ch := make(chan switchStamp, 1)
@@ -1140,8 +1251,8 @@ func (sc *UdpSidechannel) updateSwitchIndex(marker uint64, stamp switchStamp) {
 		}
 	}
 
-	// Marker 0 is never minted (markerSeq starts at 1 and only ever increments),
-	// so a MsgAskAckIndexResp carrying no marker has nothing it can resolve.
+	// Marker 0 is never minted (nextReadMarker skips it, and client markers have
+	// a nonzero upper half), so a MsgAskAckIndexResp carrying no marker has nothing it can resolve.
 	// Storing it would leak an entry in resolved that nothing ever consumes.
 	if marker == 0 {
 		return
@@ -1178,6 +1289,11 @@ func (sc *UdpSidechannel) updateSwitchIndex(marker uint64, stamp switchStamp) {
 // Handing out the global max instead would gate reads on an index a later, unrelated read happened
 // to observe, holding them at the follower for writes that may have began after the read.
 // In a write-heavy workload this can mean reads are unduly delayed.
+//
+// The caller has checked that batchMarker is this instance's (SAFE-3), so only
+// the lower halves are compared, as RFC 1982 serial numbers: pendingBatches is
+// in minting order and spans far less than 2^31 batches, so "at or below"
+// stays correct across the sequence's wrap.
 func (sc *UdpSidechannel) releasePendingBatches(batchMarker uint64, answered switchStamp) {
 	if batchMarker == 0 || answered.index == 0 || answered.term == 0 {
 		return
@@ -1188,7 +1304,7 @@ func (sc *UdpSidechannel) releasePendingBatches(batchMarker uint64, answered swi
 	consumed := 0
 	for consumed < len(sc.readGate.pendingBatches) {
 		batch := sc.readGate.pendingBatches[consumed]
-		if batch.localMarker > batchMarker {
+		if int32(uint32(batch.localMarker)-uint32(batchMarker)) > 0 {
 			break
 		}
 		for _, marker := range batch.markers {

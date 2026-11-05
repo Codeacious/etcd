@@ -611,16 +611,19 @@ func (s *EtcdServer) monitorSwitchRegister() {
 		case <-s.stopping:
 			return
 		case <-t.C:
-			// Leader-only: a demoted leader still holds a lastSentIndex, and
+			// Leader-only: a demoted leader still holds a high-water mark, and
 			// re-sending it could push a register above anything the current
 			// leader has proposed, stalling lease holders until they catch up.
 			if !s.isLeader() {
+				s.udpSideC.SetLeaseHolders(nil)
 				continue
 			}
 			// Only peers holding a read lease matter; nobody else can serve a
 			// read locally, so their switch state is irrelevant until they are
 			// granted one, and a grant re-arms the path on its own.
-			s.udpSideC.RefreshIdleSwitches(s.r.Status().ActiveReadLeases)
+			holders := s.r.Status().ActiveReadLeases
+			s.udpSideC.SetLeaseHolders(holders)
+			s.udpSideC.RefreshIdleSwitches(holders)
 		}
 	}
 }

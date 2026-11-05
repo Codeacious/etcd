@@ -471,6 +471,43 @@ func TestWritesReadHighWaterAfterBootID(t *testing.T) {
 	}
 }
 
+// TestReplyCreditsLeaseHoldersBehindSwitch: one switch register stamps the
+// reads of every follower behind it, so a reply on one follower's path is
+// credited to every lease holder behind that switch. Followers behind another
+// switch, and followers without a lease, are not credited.
+func TestReplyCreditsLeaseHoldersBehindSwitch(t *testing.T) {
+	sc := newRefreshTestSidechannel(t)
+	lr := newRecRaft()
+	sc.raft = lr
+	a := addRefreshTestPeer(sc, 2)
+	addRefreshTestPeer(sc, 3)
+	addRefreshTestPeer(sc, 5) // same switch, holds no lease
+	other := addRefreshTestPeer(sc, 4)
+	other.magic, other.sw = 0xBEEF, sc.switchFor(0xBEEF)
+	atomic.StoreUint32(&other.sw.bootID, testBootID)
+	sc.highWater = 1000
+	sc.SetLeaseHolders([]uint64{2, 3, 4})
+
+	sc.handleUdpSidechannelMsg(encodeAskAckIndexResp(sc, 2, 300), a)
+	got := map[uint64]uint64{}
+	for i := 0; i < 2; i++ {
+		c := lr.next(t)
+		got[c.m.From] = c.m.Index
+	}
+	lr.none(t, 20*time.Millisecond)
+	if got[2] != 300 || got[3] != 300 || len(got) != 2 {
+		t.Fatalf("credits %v, want 300 to 2 and 3 only", got)
+	}
+
+	// Not leader: only the path's own follower.
+	sc.SetLeaseHolders(nil)
+	sc.handleUdpSidechannelMsg(encodeAskAckIndexResp(sc, 2, 400), a)
+	if c := lr.next(t); c.m.From != 2 || c.m.Index != 400 {
+		t.Fatalf("credit %+v, want 400 to 2", c.m)
+	}
+	lr.none(t, 20*time.Millisecond)
+}
+
 // TestNackAdoptsBootAndReseeds: a NACK answering a write sent under the
 // current boot ID names the switch's new one; every path through the switch
 // adopts it, and this path is re-seeded with the high-water mark under it.
