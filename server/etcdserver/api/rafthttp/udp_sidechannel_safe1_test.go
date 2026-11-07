@@ -106,8 +106,15 @@ func (s *fakeSwitch) run() {
 		switch m.msgType {
 		case byte(raftpb.MsgApp):
 			if m.bootID == s.boot {
-				s.reg = max(s.reg, m.value)
-				s.term = max(s.term, m.term)
+				// One (term, index) pair, compared term first; a blank
+				// value changes nothing.
+				switch {
+				case m.value == 0:
+				case m.term > s.term:
+					s.reg, s.term = m.value, m.term
+				case m.term == s.term:
+					s.reg = max(s.reg, m.value)
+				}
 				m.msgType, m.value = byte(raftpb.MsgAskAckIndexResp), s.reg
 			} else {
 				m.msgType, m.value = msgSwitchNack, 0
@@ -154,7 +161,7 @@ func newRecRaft() *recRaft { return &recRaft{ch: make(chan recCredit, 64)} }
 func (r *recRaft) Process(_ context.Context, m raftpb.Message) error {
 	var hw uint64
 	if r.sc != nil {
-		hw = atomic.LoadUint64(&r.sc.highWater)
+		hw, _ = r.sc.writeState()
 	}
 	r.ch <- recCredit{m: m, highWater: hw}
 	return nil
@@ -449,7 +456,7 @@ func TestWritesReadHighWaterAfterBootID(t *testing.T) {
 			testHookBetweenBootAndHighWater = func() {
 				if !fired {
 					fired = true
-					atomicMax(&sc.highWater, 200)
+					sc.raiseOnCopy(200, 5)
 					atomic.StoreUint32(&peer.sw.bootID, newBoot)
 				}
 			}
@@ -656,5 +663,120 @@ func TestStampCarriesTermToTheGate(t *testing.T) {
 		}
 	case <-time.After(2 * ReadGateDeadlineMillis * time.Millisecond):
 		t.Fatal("read never released")
+	}
+}
+
+// TestHighWaterStartsOverOnNewTerm: the high-water mark belongs to the term
+// it was copied in. A copy from a newer term starts it over, even below the
+// old mark, so this term's writes no longer carry an earlier term's tail that
+// may never commit (LIVE-3 Part B). A copy delayed from an older term is not
+// written and leaves the mark alone. Refreshes write the current pair.
+func TestHighWaterStartsOverOnNewTerm(t *testing.T) {
+	sc := newRefreshTestSidechannel(t)
+	peer := addRefreshTestPeer(sc, 2)
+	write := func() sidechannelMsg {
+		t.Helper()
+		msgs := drain(sc)
+		if len(msgs) != 1 {
+			t.Fatalf("got %d writes, want 1", len(msgs))
+		}
+		return decodeSidechannelMsg(msgs[0].msg[:])
+	}
+
+	tapMsgApp(sc, 2, 5, 899, 1)
+	if w := write(); w.value != 900 || w.term != 5 {
+		t.Fatalf("term 5 write %+v, want 900 at 5", w)
+	}
+	tapMsgApp(sc, 2, 7, 119, 1)
+	if w := write(); w.value != 120 || w.term != 7 {
+		t.Fatalf("term 7 write %+v, want 120 at 7", w)
+	}
+	if hw, term := sc.writeState(); hw != 120 || term != 7 {
+		t.Fatalf("write state (%d, %d), want (120, 7)", hw, term)
+	}
+
+	// Delayed copies from term 5, on this path and on one with no write yet
+	// (where the per-path dedupe would not catch it).
+	addRefreshTestPeer(sc, 3)
+	tapMsgApp(sc, 2, 5, 949, 1)
+	tapMsgApp(sc, 3, 5, 949, 1)
+	if msgs := drain(sc); len(msgs) != 0 {
+		t.Fatalf("an older term's copy sent %d writes", len(msgs))
+	}
+	if hw, term := sc.writeState(); hw != 120 || term != 7 {
+		t.Fatalf("an older term's copy moved the write state to (%d, %d)", hw, term)
+	}
+
+	sc.refreshPeerSwitch(peer)
+	if w := write(); w.value != 120 || w.term != 7 {
+		t.Fatalf("refresh %+v, want 120 at 7", w)
+	}
+}
+
+// TestCreditCarriesReplyTerm: every credit tells raft the term the switch
+// reported with it (LogTerm), which raft requires to be its own: the switch's
+// index rises only within a term (LIVE-3 Part B). That holds for the path's
+// follower and for the other lease holders behind the switch.
+func TestCreditCarriesReplyTerm(t *testing.T) {
+	sc := newRefreshTestSidechannel(t)
+	lr := newRecRaft()
+	sc.raft = lr
+	a := addRefreshTestPeer(sc, 2)
+	addRefreshTestPeer(sc, 3)
+	sc.highWater = 1000
+	sc.SetLeaseHolders([]uint64{2, 3})
+
+	sc.handleUdpSidechannelMsg(encodeAskAckIndexResp(sc, 2, 300), a)
+	for i := 0; i < 2; i++ {
+		if c := lr.next(t); c.m.Term != 0 || c.m.LogTerm != uint64(testTerm) {
+			t.Fatalf("credit %+v, want Term 0 and LogTerm %d", c.m, testTerm)
+		}
+	}
+	lr.none(t, 20*time.Millisecond)
+}
+
+// TestNewTermWriteReplacesOlderIndex runs the term change through the switch
+// contract: a new term's first write replaces the register, even with a lower
+// index, and is credited in its own term; a deposed leader's late write from
+// the older term then changes nothing.
+func TestNewTermWriteReplacesOlderIndex(t *testing.T) {
+	sw := newFakeSwitch(t)
+	leader, lr := newSafe1Leader(t, sw)
+	tapMsgApp(leader, 2, 5, 899, 1) // NACKed, then re-seeded and credited
+	lr.next(t)
+	if st := sw.stamp(); st.index != 900 || st.term != 5 {
+		t.Fatalf("term 5 stamp %+v, want 900 at 5", st)
+	}
+
+	tapMsgApp(leader, 2, 7, 119, 1)
+	if c := lr.next(t); c.m.Index != 120 || c.m.LogTerm != 7 {
+		t.Fatalf("term 7 credit %+v, want 120 at 7", c.m)
+	}
+	if st := sw.stamp(); st.index != 120 || st.term != 7 {
+		t.Fatalf("term 7 stamp %+v, want 120 at 7, not the old index relabelled", st)
+	}
+
+	// Another node's late write from term 5.
+	c, err := net.DialUDP("udp", nil, sw.conn.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	late := sidechannelMsg{magic: DefaultUdpSidechannelMagic, msgType: byte(raftpb.MsgApp),
+		to: 2, from: 9, value: 950, bootID: sw.bootID(), term: 5}.encode()
+	if _, err := c.Write(late[:]); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply := decodeSidechannelMsg(buf[:n]); reply.value != 120 || reply.term != 7 {
+		t.Fatalf("late write answered %+v, want the stored 120 at 7", reply)
+	}
+	if st := sw.stamp(); st.index != 120 || st.term != 7 {
+		t.Fatalf("a late older-term write moved the stamp to %+v", st)
 	}
 }

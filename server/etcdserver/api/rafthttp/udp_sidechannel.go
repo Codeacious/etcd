@@ -102,19 +102,6 @@ func decodeSidechannelMsg(buf []byte) sidechannelMsg {
 	}
 }
 
-// atomicMax raises *addr to at least v and returns the resulting value.
-func atomicMax(addr *uint64, v uint64) uint64 {
-	for {
-		cur := atomic.LoadUint64(addr)
-		if v <= cur {
-			return cur
-		}
-		if atomic.CompareAndSwapUint64(addr, cur, v) {
-			return v
-		}
-	}
-}
-
 // readGateAsk is a marker for a read waiting on the switch, with the time it becomes
 // eligible to be included in a switch query. Per-read rather than batched because the
 // ask timer is shared.
@@ -208,16 +195,21 @@ type UdpSidechannel struct {
 	// Used to allow leaders to bypass the gate. nil means the gate is always used.
 	gateActive func() bool
 
-	// highWater is the largest index this node has proposed to any switch:
-	// the end of every MsgApp it has copied, and nothing else. Every write
-	// carries it, and every credit is capped at it, so whichever write reaches
-	// a freshly booted switch first covers every credit this node has given
-	// (SAFE-1).
-	highWater uint64 // atomic
+	// writeMu guards highWater and leaderTerm, which change together.
+	writeMu sync.Mutex
+	// highWater is the largest index this node has proposed to any switch in
+	// leaderTerm: the end of every MsgApp it has copied in that term, and
+	// nothing else. Every write carries it, and every credit is capped at it,
+	// so whichever write reaches a freshly booted switch first covers every
+	// credit this node has given in the term (SAFE-1). It starts over when
+	// leaderTerm rises: the switch keeps one (term, index) pair, and an
+	// earlier term's mark would hold this term's reads back until commit
+	// passed it (LIVE-3 Part B).
+	highWater uint64
 	// leaderTerm is the highest term of any MsgApp this node has copied to a
 	// switch, i.e. a term in which it was leader. Refreshes and re-seeds,
 	// which no raft message carries a term for, write with it.
-	leaderTerm uint64 // atomic
+	leaderTerm uint64
 
 	// switches maps a switch's magic (unique per switch by configuration) to
 	// what this node knows about it. Every path crossing a switch shares it.
@@ -274,6 +266,31 @@ type udpPeerInfo struct {
 	sentMu            sync.Mutex
 	lastSentTerm      uint64
 	lastSentHighWater uint64
+}
+
+// raiseOnCopy records a MsgApp copy ending at end in term, and returns the
+// high-water mark to write. A copy from a newer term starts the mark over at
+// end; one from an older term (a copy delayed past this node's next term as
+// leader) is not written at all (ok false), and leaves the mark alone.
+func (sc *UdpSidechannel) raiseOnCopy(end, term uint64) (highWater uint64, ok bool) {
+	sc.writeMu.Lock()
+	defer sc.writeMu.Unlock()
+	switch {
+	case term < sc.leaderTerm:
+		return 0, false
+	case term > sc.leaderTerm:
+		sc.highWater, sc.leaderTerm = end, term
+	default:
+		sc.highWater = max(sc.highWater, end)
+	}
+	return sc.highWater, true
+}
+
+// writeState returns the high-water mark and the term it belongs to.
+func (sc *UdpSidechannel) writeState() (highWater, leaderTerm uint64) {
+	sc.writeMu.Lock()
+	defer sc.writeMu.Unlock()
+	return sc.highWater, sc.leaderTerm
 }
 
 // recordLastSent records a MsgApp copy of (term, highWater) on this path and
@@ -573,7 +590,7 @@ func (sc *UdpSidechannel) creditSwitchReply(peer *udpPeerInfo, m sidechannelMsg)
 	// Read the high-water mark before the boot check. If the check passes, any
 	// adoption of a newer boot comes after this read, and its re-seed then
 	// writes at least this much, covering the credit below.
-	highWater := atomic.LoadUint64(&sc.highWater)
+	highWater, _ := sc.writeState()
 	if m.bootID != atomic.LoadUint32(&peer.sw.bootID) {
 		return
 	}
@@ -588,7 +605,7 @@ func (sc *UdpSidechannel) creditSwitchReply(peer *udpPeerInfo, m sidechannelMsg)
 	if credit == 0 {
 		return // nothing proposed yet
 	}
-	sc.injectCredit(m.to, m.from, credit)
+	sc.injectCredit(m.to, m.from, credit, m.term)
 
 	// Credit every other lease holder behind this switch too, not just the
 	// follower whose path carried the write: the switch's one register stamps
@@ -602,23 +619,26 @@ func (sc *UdpSidechannel) creditSwitchReply(peer *udpPeerInfo, m sidechannelMsg)
 				continue
 			}
 			if v, ok := sc.peers.Load(types.ID(id)); ok && v.(*udpPeerInfo).sw == peer.sw {
-				sc.injectCredit(m.to, id, credit)
+				sc.injectCredit(m.to, id, credit, m.term)
 			}
 		}
 	}
 }
 
 // injectCredit hands raft a switch credit for follower from: a Term-0
-// MsgAskAckIndexResp raising that holder's grant to index.
-func (sc *UdpSidechannel) injectCredit(to, from, index uint64) {
+// MsgAskAckIndexResp raising that holder's grant to index. LogTerm carries the
+// term the switch reported with it; raft credits it only in that term, since
+// the switch's index rises only within a term (LIVE-3 Part B).
+func (sc *UdpSidechannel) injectCredit(to, from, index uint64, term uint32) {
 	if sc.raft == nil {
 		return
 	}
 	genMsg := raftpb.Message{
-		Type:  raftpb.MsgAskAckIndexResp,
-		To:    to,
-		From:  from,
-		Index: index,
+		Type:    raftpb.MsgAskAckIndexResp,
+		To:      to,
+		From:    from,
+		Index:   index,
+		LogTerm: uint64(term),
 	}
 	if err := sc.raft.Process(sc.ctx, genMsg); err != nil {
 		sc.lg.Warn("failed to process MsgAskAckIndexResp via Raft",
@@ -733,9 +753,8 @@ func (sc *UdpSidechannel) ProcessOutgoingMessage(m *raftpb.Message) {
 		// deposed leader may already have advanced.
 		bootID := atomic.LoadUint32(&peer.sw.bootID) // before the high-water mark; see switchWrite
 		testHookBetweenBootAndHighWater()
-		highWater := atomicMax(&sc.highWater, m.Index+uint64(len(m.Entries)))
-		atomicMax(&sc.leaderTerm, m.Term)
-		if !peer.recordLastSent(m.Term, highWater) {
+		highWater, ok := sc.raiseOnCopy(m.Index+uint64(len(m.Entries)), m.Term)
+		if !ok || !peer.recordLastSent(m.Term, highWater) {
 			return
 		}
 		sc.enqueue(sc.switchWrite(peer, bootID, highWater, m.Term))
@@ -793,12 +812,12 @@ func (sc *UdpSidechannel) RefreshIdleSwitches(holders []uint64) {
 func (sc *UdpSidechannel) refreshPeerSwitch(peer *udpPeerInfo) {
 	bootID := atomic.LoadUint32(&peer.sw.bootID) // before the high-water mark; see switchWrite
 	testHookBetweenBootAndHighWater()
-	highWater := atomic.LoadUint64(&sc.highWater)
+	highWater, leaderTerm := sc.writeState()
 	if highWater == 0 {
 		// Never tapped anything; nothing to restore.
 		return
 	}
-	sc.enqueue(sc.switchWrite(peer, bootID, highWater, atomic.LoadUint64(&sc.leaderTerm)))
+	sc.enqueue(sc.switchWrite(peer, bootID, highWater, leaderTerm))
 }
 
 // testHookBetweenBootAndHighWater runs between a write's boot ID load and its
