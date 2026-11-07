@@ -38,6 +38,26 @@ var (
 		Name:      "is_leader",
 		Help:      "Whether or not this member is a leader. 1 if is, 0 otherwise.",
 	})
+	// readLeaseReads copies raft's grant-leases read counters (EXP-6). Gauges,
+	// not counters: raft zeroes them when it resets on a term change.
+	readLeaseReads = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "etcd",
+		Subsystem: "server",
+		Name:      "read_lease_reads",
+		Help: "Follower reads under grant-leases, as raft counts them since its last reset, by kind: " +
+			"query (decided: served or forwarded), local (served from this node's lease), held " +
+			"(held for commit to catch up first). Copied from raft once per second.",
+	}, []string{"kind"})
+	// switchCreditsAccepted copies raft's count of switch credits it acted on
+	// (EXP-6, review tack-08 F6); the sidechannel's own counters see only
+	// credits fed to raft. A gauge for the same reason as readLeaseReads.
+	switchCreditsAccepted = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "etcd",
+		Subsystem: "server",
+		Name:      "switch_credits_accepted",
+		Help: "Switch credits this leader's raft accepted (term matched, a grant to raise), " +
+			"since raft's last reset. Copied from raft once per second.",
+	})
 	leaderChanges = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "etcd",
 		Subsystem: "server",
@@ -165,6 +185,8 @@ func init() {
 	prometheus.MustRegister(hasLeader)
 	prometheus.MustRegister(isLeader)
 	prometheus.MustRegister(leaderChanges)
+	prometheus.MustRegister(readLeaseReads)
+	prometheus.MustRegister(switchCreditsAccepted)
 	prometheus.MustRegister(heartbeatSendFailures)
 	prometheus.MustRegister(applySnapshotInProgress)
 	prometheus.MustRegister(proposalsCommitted)

@@ -592,20 +592,25 @@ func (sc *UdpSidechannel) creditSwitchReply(peer *udpPeerInfo, m sidechannelMsg)
 	// writes at least this much, covering the credit below.
 	highWater, _ := sc.writeState()
 	if m.bootID != atomic.LoadUint32(&peer.sw.bootID) {
+		repliesStaleBoot.Inc()
 		return
 	}
 	sc.updateSwitchIndex(0, switchStamp{index: m.value, term: m.term})
 	if m.value == 0 {
 		// Nothing written on this boot yet: no information, and no credit.
+		repliesNoValue.Inc()
 		return
 	}
 	// Mark the switch as updated (i.e. not freshly rebooted/wiped).
 	atomic.StoreUint32(&peer.switchUpdated, 1)
 	credit := min(m.value, highWater)
 	if credit == 0 {
+		repliesNoMark.Inc()
 		return // nothing proposed yet
 	}
+	repliesCredited.Inc()
 	sc.injectCredit(m.to, m.from, credit, m.term)
+	creditsPath.Inc()
 
 	// Credit every other lease holder behind this switch too, not just the
 	// follower whose path carried the write: the switch's one register stamps
@@ -620,6 +625,7 @@ func (sc *UdpSidechannel) creditSwitchReply(peer *udpPeerInfo, m sidechannelMsg)
 			}
 			if v, ok := sc.peers.Load(types.ID(id)); ok && v.(*udpPeerInfo).sw == peer.sw {
 				sc.injectCredit(m.to, id, credit, m.term)
+				creditsOtherHolder.Inc()
 			}
 		}
 	}
@@ -663,12 +669,15 @@ func (sc *UdpSidechannel) injectCredit(to, from, index uint64, term uint32) {
 // the next MsgApp copy or by RefreshIdleSwitches.
 func (sc *UdpSidechannel) handleSwitchNack(peer *udpPeerInfo, m sidechannelMsg) {
 	if m.bootID == 0 {
+		nacksInvalid.Inc()
 		return // never reported by a switch
 	}
 	sw := peer.sw
 	cur := atomic.LoadUint32(&sw.bootID)
+	adopted := false
 	if m.marker == uint64(cur) && m.bootID != cur &&
 		atomic.CompareAndSwapUint32(&sw.bootID, cur, m.bootID) {
+		adopted = true
 		sc.lg.Info("UDP sidechannel switch boot ID changed; re-seeding",
 			zap.String("peerID", peer.id.String()),
 			zap.Uint16("magic", peer.magic),
@@ -680,7 +689,14 @@ func (sc *UdpSidechannel) handleSwitchNack(peer *udpPeerInfo, m sidechannelMsg) 
 			return true
 		})
 	}
-	if m.bootID == atomic.LoadUint32(&sw.bootID) {
+	switch {
+	case m.bootID != atomic.LoadUint32(&sw.bootID):
+		nacksStale.Inc()
+	case adopted:
+		nacksAdopted.Inc()
+		sc.refreshPeerSwitch(peer)
+	default:
+		nacksCurrent.Inc()
 		sc.refreshPeerSwitch(peer)
 	}
 }
@@ -713,6 +729,7 @@ func (sc *UdpSidechannel) enqueue(msg udpSidechannelMsg) {
 	select {
 	case sc.out <- msg:
 	default:
+		sidechannelSendDropped.Inc()
 		if n := atomic.AddUint64(&sc.outDropped, 1); n%128 == 1 {
 			sc.lg.Warn("UDP sidechannel out channel full, dropping switch hint",
 				zap.String("peerID", msg.peerID.String()),
@@ -1177,7 +1194,9 @@ func MagicFromStr(s string) (uint16, error) {
 //
 // Only the caller's own deadline produces an error, which is a genuinely failed read.
 func (sc *UdpSidechannel) WaitForReadGate(ctx context.Context, marker uint64) (index uint64, term uint64, err error) {
+	waits := gateWaitsClient
 	if !isClientMarker(marker) {
+		waits = gateWaitsServer
 		// Marker-less read (client not speaking the assist protocol), or a
 		// client marker in the server namespace (SAFE-7: treated as none, since
 		// its reflection is dropped). Mint a server-side marker; the zero-upper-32
@@ -1194,6 +1213,7 @@ func (sc *UdpSidechannel) WaitForReadGate(ctx context.Context, marker uint64) (i
 	// else there's a gap where a marker can arrive and isn't consumed.
 	if stamp, ok := sc.readGate.resolved.take(marker); ok {
 		sc.readGate.pending.Delete(marker)
+		waits.ready.Inc()
 		return stamp.index, uint64(stamp.term), nil
 	}
 
@@ -1212,6 +1232,7 @@ func (sc *UdpSidechannel) WaitForReadGate(ctx context.Context, marker uint64) (i
 		// than parking here (same outcome as the wait below).
 		sc.readGate.pending.Delete(marker)
 		atomic.AddUint64(&sc.readGate.gateTimeouts, 1)
+		waits.deadline.Inc()
 		return math.MaxUint64, 0, nil
 	case <-ctx.Done():
 		sc.readGate.pending.Delete(marker)
@@ -1220,10 +1241,12 @@ func (sc *UdpSidechannel) WaitForReadGate(ctx context.Context, marker uint64) (i
 
 	select {
 	case stamp := <-ch:
+		waits.waited.Inc()
 		return stamp.index, uint64(stamp.term), nil
 	case <-gateTimer.C:
 		sc.readGate.pending.Delete(marker)
 		atomic.AddUint64(&sc.readGate.gateTimeouts, 1)
+		waits.deadline.Inc()
 		return math.MaxUint64, 0, nil
 	case <-ctx.Done():
 		sc.readGate.pending.Delete(marker)
@@ -1254,6 +1277,7 @@ func (sc *UdpSidechannel) SwitchGateStats() (zeroAnswers, gateTimeouts uint64) {
 // held the returned index at some time AFTER the read began.
 func (sc *UdpSidechannel) updateSwitchIndex(marker uint64, stamp switchStamp) {
 	if stamp.index == 0 || stamp.term == 0 {
+		sidechannelZeroAnswers.Inc()
 		atomic.AddUint64(&sc.readGate.zeroAnswers, 1)
 		return
 	}

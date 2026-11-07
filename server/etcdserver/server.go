@@ -588,6 +588,7 @@ func (s *EtcdServer) Start() {
 	s.GoAttach(s.monitorCompactHash)
 	s.GoAttach(s.monitorDowngrade)
 	s.GoAttach(s.monitorSwitchRegister)
+	s.GoAttach(s.monitorReadLeaseStats)
 }
 
 // switchRegisterRefreshInterval is how often the leader checks whether each
@@ -624,6 +625,39 @@ func (s *EtcdServer) monitorSwitchRegister() {
 			holders := s.r.Status().ActiveReadLeases
 			s.udpSideC.SetLeaseHolders(holders)
 			s.udpSideC.RefreshIdleSwitches(holders)
+		}
+	}
+}
+
+// readLeaseStatsInterval is how often monitorReadLeaseStats copies raft's
+// read counters into etcd_server_read_lease_reads.
+const readLeaseStatsInterval = time.Second
+
+// monitorReadLeaseStats exports raft's grant-leases read counters (EXP-6): how
+// many follower reads were served from the lease, forwarded, or held first,
+// and on a leader how many switch credits raft accepted.
+// They live in raft and reach etcd only through Status, so they are copied
+// here once per second rather than on every read. Only grant-leases counts
+// them; other modes start nothing.
+func (s *EtcdServer) monitorReadLeaseStats() {
+	if parseReadOnlyOption(s.Cfg.ReadOnlyMode) != raft.ReadOnlyGrantLeases {
+		return
+	}
+	query := readLeaseReads.WithLabelValues("query")
+	local := readLeaseReads.WithLabelValues("local")
+	held := readLeaseReads.WithLabelValues("held")
+	t := time.NewTicker(readLeaseStatsInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.stopping:
+			return
+		case <-t.C:
+			st := s.r.Status().ReadLeaseStats
+			query.Set(float64(st.TimesGotReadQuery))
+			local.Set(float64(st.TimesReadLeaseUsed))
+			held.Set(float64(st.TimesReadHeld))
+			switchCreditsAccepted.Set(float64(st.TimesCreditAccepted))
 		}
 	}
 }

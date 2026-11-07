@@ -180,6 +180,98 @@ var (
 	)
 )
 
+// UDP sidechannel counters (assist mode; EXP-6). A mode that has fallen back
+// to a slower path still succeeds, so these are what tell it apart: a write
+// committed without a switch credit, a read that waited for a query or gave up
+// on the gate. They are read only at cell boundaries.
+var (
+	sidechannelReplies = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "etcd",
+		Subsystem: "network",
+		Name:      "sidechannel_replies_total",
+		Help: "Switch replies to this leader's writes, by outcome: credited (raft was fed a credit), " +
+			"stale_boot (from another switch boot; dropped), no_value (the switch holds nothing this boot), " +
+			"no_mark (nothing proposed yet, so nothing to credit).",
+	}, []string{"result"})
+
+	sidechannelCredits = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "etcd",
+		Subsystem: "network",
+		Name:      "sidechannel_credits_total",
+		Help: "Switch credits fed to raft, by holder: path (the follower whose path carried the write) " +
+			"or other_holder (another lease holder behind the same switch, credit-all).",
+	}, []string{"holder"})
+
+	sidechannelNacks = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "etcd",
+		Subsystem: "network",
+		Name:      "sidechannel_nacks_total",
+		Help: "Switch NACKs, by outcome: adopted (a new boot ID), current (re-seed under the current boot), " +
+			"stale (answers an older belief; ignored), invalid (boot ID 0).",
+	}, []string{"result"})
+
+	sidechannelSendDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "etcd",
+		Subsystem: "network",
+		Name:      "sidechannel_send_dropped_total",
+		Help:      "Sidechannel messages dropped because the send queue was full.",
+	})
+
+	sidechannelZeroAnswers = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "etcd",
+		Subsystem: "network",
+		Name:      "sidechannel_zero_answers_total",
+		Help:      "Switch stamps or query answers with index or term 0, discarded as unusable.",
+	})
+
+	sidechannelGateWaits = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "etcd",
+		Subsystem: "network",
+		Name:      "sidechannel_read_gate_waits_total",
+		Help: "Follower read-gate waits, by marker (client: the client's gate packet; server: minted, " +
+			"answered by a batched switch query) and outcome (ready: stamp already there; waited: stamp " +
+			"arrived during the wait; deadline: gave up, so the read is forwarded to the leader).",
+	}, []string{"marker", "outcome"})
+)
+
+// Label children resolved once, so the hot paths don't hash labels.
+var (
+	repliesCredited  = sidechannelReplies.WithLabelValues("credited")
+	repliesStaleBoot = sidechannelReplies.WithLabelValues("stale_boot")
+	repliesNoValue   = sidechannelReplies.WithLabelValues("no_value")
+	repliesNoMark    = sidechannelReplies.WithLabelValues("no_mark")
+
+	creditsPath        = sidechannelCredits.WithLabelValues("path")
+	creditsOtherHolder = sidechannelCredits.WithLabelValues("other_holder")
+
+	nacksAdopted = sidechannelNacks.WithLabelValues("adopted")
+	nacksCurrent = sidechannelNacks.WithLabelValues("current")
+	nacksStale   = sidechannelNacks.WithLabelValues("stale")
+	nacksInvalid = sidechannelNacks.WithLabelValues("invalid")
+
+	gateWaitsClient = newGateWaits("client")
+	gateWaitsServer = newGateWaits("server")
+)
+
+type gateWaits struct{ ready, waited, deadline prometheus.Counter }
+
+func newGateWaits(marker string) gateWaits {
+	return gateWaits{
+		ready:    sidechannelGateWaits.WithLabelValues(marker, "ready"),
+		waited:   sidechannelGateWaits.WithLabelValues(marker, "waited"),
+		deadline: sidechannelGateWaits.WithLabelValues(marker, "deadline"),
+	}
+}
+
+func init() {
+	prometheus.MustRegister(sidechannelReplies)
+	prometheus.MustRegister(sidechannelCredits)
+	prometheus.MustRegister(sidechannelNacks)
+	prometheus.MustRegister(sidechannelSendDropped)
+	prometheus.MustRegister(sidechannelZeroAnswers)
+	prometheus.MustRegister(sidechannelGateWaits)
+}
+
 func init() {
 	prometheus.MustRegister(activePeers)
 	prometheus.MustRegister(disconnectedPeers)
