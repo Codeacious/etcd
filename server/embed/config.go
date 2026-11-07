@@ -538,6 +538,15 @@ type Config struct {
 	// ExperimentalUdpSidechannelMagic is the 16-bit magic number for the UDP sidechannel protocol.
 	ExperimentalUdpSidechannelMagic int `json:"experimental-udp-sidechannel-magic"`
 
+	// ExperimentalCommitTraceEvents is the size, in events, of the leader's
+	// commit-trace ring (raft Config.CommitTrace). 0 disables it.
+	ExperimentalCommitTraceEvents int `json:"experimental-commit-trace-events"`
+
+	// ExperimentalMaxReadLeases caps how many followers may hold a read lease
+	// at once in --read-mode grant-leases (raft Config.MaxNumReadLeases). 0
+	// uses the built-in default (etcdserver.DefaultMaxReadLeases).
+	ExperimentalMaxReadLeases int `json:"experimental-max-read-leases"`
+
 	// ExperimentalPeerSkipClientSanVerification determines whether to skip verification of SAN field
 	// in client certificate for peer connections.
 	// TODO: Delete in v3.7
@@ -929,6 +938,12 @@ func (cfg *Config) AddFlags(fs *flag.FlagSet) {
 	fs.IntVar(&cfg.ExperimentalUdpSidechannelPort, "experimental-udp-sidechannel-port", 0, "UDP port the sidechannel listens on.")
 	fs.IntVar(&cfg.ExperimentalUdpSidechannelMagic, "experimental-udp-sidechannel-magic", 0, "16-bit magic number for UDP sidechannel protocol.")
 
+	// experimental commit trace
+	fs.IntVar(&cfg.ExperimentalCommitTraceEvents, "experimental-commit-trace-events", 0, "Size in events (16 bytes each) of the leader's commit-trace ring, dumped from loopback at /debug/tack/commit-trace. 0 disables it.")
+
+	// experimental read leases
+	fs.IntVar(&cfg.ExperimentalMaxReadLeases, "experimental-max-read-leases", 0, "Most followers that may hold a read lease at once under --read-mode grant-leases. 0 uses the built-in default (5).")
+
 	// auth
 	fs.StringVar(&cfg.AuthToken, "auth-token", cfg.AuthToken, "Specify auth token specific options.")
 	fs.UintVar(&cfg.BcryptCost, "bcrypt-cost", cfg.BcryptCost, "Specify bcrypt algorithm cost factor for auth password hashing.")
@@ -1219,6 +1234,9 @@ func (cfg *Config) Validate() error {
 
 	if err := cfg.setupLogging(); err != nil {
 		return err
+	}
+	if cfg.ExperimentalMaxReadLeases < 0 {
+		return fmt.Errorf("--experimental-max-read-leases must be >= 0 (0 uses the default), got %d", cfg.ExperimentalMaxReadLeases)
 	}
 	if err := checkBindURLs(cfg.ListenPeerUrls); err != nil {
 		return err

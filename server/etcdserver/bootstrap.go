@@ -164,6 +164,9 @@ type bootstrappedRaft struct {
 	peers   []raft.Peer
 	config  *raft.Config
 	storage *raft.MemoryStorage
+
+	// commitTrace is config.CommitTrace's recorder; nil when tracing is off.
+	commitTrace *commitTrace
 }
 
 func bootstrapStorage(cfg config.ServerConfig, st v2store.Store, be *bootstrappedBackend, wal *bootstrappedWAL, cl *bootstrappedCluster) *bootstrappedStorage {
@@ -472,17 +475,25 @@ func (c *bootstrappedCluster) databaseFileMissing(s *bootstrappedStorage) bool {
 }
 
 func bootstrapRaft(cfg config.ServerConfig, cluster *bootstrappedCluster, bwal *bootstrappedWAL) *bootstrappedRaft {
+	var b *bootstrappedRaft
 	switch {
 	case !bwal.haveWAL && !cfg.NewCluster:
-		return bootstrapRaftFromCluster(cfg, cluster.cl, nil, bwal)
+		b = bootstrapRaftFromCluster(cfg, cluster.cl, nil, bwal)
 	case !bwal.haveWAL && cfg.NewCluster:
-		return bootstrapRaftFromCluster(cfg, cluster.cl, cluster.cl.MemberIDs(), bwal)
+		b = bootstrapRaftFromCluster(cfg, cluster.cl, cluster.cl.MemberIDs(), bwal)
 	case bwal.haveWAL:
-		return bootstrapRaftFromWAL(cfg, bwal)
+		b = bootstrapRaftFromWAL(cfg, bwal)
 	default:
 		cfg.Logger.Panic("unsupported bootstrap config")
 		return nil
 	}
+	if n := cfg.ExperimentalCommitTraceEvents; n > 0 {
+		b.commitTrace = newCommitTrace(b.config.ID, n)
+		b.config.CommitTrace = b.commitTrace.record
+		cfg.Logger.Info("commit trace enabled",
+			zap.Int("events", n), zap.Int("ring-bytes", n*commitTraceRecSize))
+	}
+	return b
 }
 
 func bootstrapRaftFromCluster(cfg config.ServerConfig, cl *membership.RaftCluster, ids []types.ID, bwal *bootstrappedWAL) *bootstrappedRaft {
@@ -534,6 +545,12 @@ func parseReadOnlyOption(mode string) raft.ReadOnlyOption {
 	}
 }
 
+// DefaultMaxReadLeases is how many followers may hold a read lease at once in
+// grant-leases mode unless --experimental-max-read-leases says otherwise. The
+// cap bounds how many holders the leader's commit clamp waits on; a cluster
+// with more followers than the cap leaves the rest without a lease.
+const DefaultMaxReadLeases = 5
+
 func raftConfig(cfg config.ServerConfig, id uint64, s *raft.MemoryStorage) *raft.Config {
 	roOption := parseReadOnlyOption(cfg.ReadOnlyMode)
 	c := &raft.Config{
@@ -555,7 +572,10 @@ func raftConfig(cfg config.ServerConfig, id uint64, s *raft.MemoryStorage) *raft
 		c.ReadLeaseDurationMicros = 500000 // 500ms
 	}
 	if roOption == raft.ReadOnlyGrantLeases {
-		c.MaxNumReadLeases = 5
+		c.MaxNumReadLeases = DefaultMaxReadLeases
+		if n := cfg.ExperimentalMaxReadLeases; n > 0 {
+			c.MaxNumReadLeases = n
+		}
 		c.AskForReadLease = true
 		c.ReadLeaseCatchupMargin = 10
 	}

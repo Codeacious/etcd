@@ -351,6 +351,10 @@ Experimental feature:
     UDP port the sidechannel listens on. 0 uses the built-in default (7700).
   --experimental-udp-sidechannel-magic '0'
     16-bit magic number for UDP sidechannel protocol. 0 uses the built-in default (0xFEED).
+  --experimental-commit-trace-events '0'
+    Size in events (16 bytes each) of the leader's commit-trace ring, dumped from loopback at /debug/tack/commit-trace. 0 disables it.
+  --experimental-max-read-leases '0'
+    Most followers that may hold a read lease at once under --read-mode grant-leases. 0 uses the built-in default (5).
 
 Unsafe feature:
   --force-new-cluster 'false'

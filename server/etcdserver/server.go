@@ -247,6 +247,10 @@ type EtcdServer struct {
 	// udpSideC is a reference to the UDP sidechannel for server-initiated switch queries.
 	udpSideC *rafthttp.UdpSidechannel
 
+	// commitTrace records the leader's replication events when
+	// --experimental-commit-trace-events is set; nil otherwise.
+	commitTrace *commitTrace
+
 	// stop signals the run goroutine should shutdown.
 	stop chan struct{}
 	// stopping is closed by run goroutine on shutdown.
@@ -354,6 +358,7 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 		consistIndex:          b.storage.backend.ci,
 		firstCommitInTerm:     notify.NewNotifier(),
 		clusterVersionChanged: notify.NewNotifier(),
+		commitTrace:           b.raft.commitTrace,
 	}
 
 	addFeatureGateMetrics(cfg.ServerFeatureGate, serverFeatureEnabled)

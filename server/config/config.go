@@ -230,6 +230,16 @@ type ServerConfig struct {
 	// UDP sidechannel protocol. Defaults to DefaultUdpSidechannelMagic.
 	ExperimentalUdpSidechannelMagic uint16 `json:"experimental-udp-sidechannel-magic"`
 
+	// ExperimentalCommitTraceEvents is the size, in events, of the ring that
+	// records the leader's raft replication events (raft Config.CommitTrace)
+	// for offline commit-latency analysis. 0 (the default) installs no hook.
+	ExperimentalCommitTraceEvents int `json:"experimental-commit-trace-events"`
+
+	// ExperimentalMaxReadLeases caps the followers holding a read lease at once
+	// under --read-mode grant-leases (raft Config.MaxNumReadLeases). 0 uses
+	// DefaultMaxReadLeases.
+	ExperimentalMaxReadLeases int `json:"experimental-max-read-leases"`
+
 	// ServerFeatureGate is a server level feature gate
 	ServerFeatureGate featuregate.FeatureGate
 

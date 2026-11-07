@@ -240,6 +240,8 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
 		ExperimentalUdpSidechannelIP:      cfg.ExperimentalUdpSidechannelIP,
 		ExperimentalUdpSidechannelPort:    cfg.ExperimentalUdpSidechannelPort,
 		ExperimentalUdpSidechannelMagic:   uint16(cfg.ExperimentalUdpSidechannelMagic),
+		ExperimentalCommitTraceEvents:     cfg.ExperimentalCommitTraceEvents,
+		ExperimentalMaxReadLeases:         cfg.ExperimentalMaxReadLeases,
 		ServerFeatureGate:                 cfg.ServerFeatureGate,
 		Metrics:                           cfg.Metrics,
 	}
@@ -781,6 +783,9 @@ func (e *Etcd) serveClients() {
 	etcdhttp.HandleVersion(mux, e.Server)
 	etcdhttp.HandleMetrics(mux)
 	etcdhttp.HandleHealth(e.cfg.logger, mux, e.Server)
+	if e.cfg.ExperimentalCommitTraceEvents > 0 {
+		etcdhttp.HandleCommitTrace(mux, e.Server)
+	}
 
 	var gopts []grpc.ServerOption
 	if e.cfg.GRPCKeepAliveMinTime > time.Duration(0) {
